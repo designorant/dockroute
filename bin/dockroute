@@ -1,0 +1,176 @@
+#!/bin/bash
+set -e
+
+# dockroute - Local development proxy for Docker
+# Eliminates port conflicts by routing via hostnames
+
+VERSION="1.0.0"
+PROXY_NAME="dockroute-traefik"
+NETWORK_NAME="proxy"
+
+# Determine compose file location
+# Priority: 1) Script's local share dir, 2) Homebrew share dir
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -f "${SCRIPT_DIR}/share/docker-compose.yml" ]]; then
+	COMPOSE_FILE="${SCRIPT_DIR}/share/docker-compose.yml"
+elif [[ -n "${HOMEBREW_PREFIX:-}" && -f "${HOMEBREW_PREFIX}/share/dockroute/docker-compose.yml" ]]; then
+	COMPOSE_FILE="${HOMEBREW_PREFIX}/share/dockroute/docker-compose.yml"
+else
+	echo "Error: Could not find docker-compose.yml"
+	echo "Expected at: ${SCRIPT_DIR}/share/docker-compose.yml"
+	exit 1
+fi
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+cmd_start() {
+	# Create network if needed
+	if ! docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
+		echo "Creating Docker network '$NETWORK_NAME'..."
+		docker network create "$NETWORK_NAME"
+	fi
+
+	# Start Traefik if not running
+	if ! docker ps --format '{{.Names}}' | grep -q "^${PROXY_NAME}$"; then
+		echo -e "${GREEN}Starting dockroute...${NC}"
+		docker compose -f "$COMPOSE_FILE" -p dockroute up -d
+		echo ""
+		echo -e "${GREEN}✓ Proxy running${NC}"
+		echo "  Dashboard: http://localhost:8080"
+		echo "  Projects:  http://<project>.localhost"
+	else
+		echo -e "${GREEN}✓ Proxy already running${NC}"
+	fi
+}
+
+cmd_stop() {
+	if docker ps --format '{{.Names}}' | grep -q "^${PROXY_NAME}$"; then
+		echo "Stopping dockroute..."
+		docker compose -f "$COMPOSE_FILE" -p dockroute down
+		echo -e "${GREEN}✓ Stopped${NC}"
+	else
+		echo -e "${YELLOW}Proxy is not running${NC}"
+	fi
+}
+
+cmd_status() {
+	echo "dockroute status"
+	echo "======================"
+	echo ""
+
+	if docker ps --format '{{.Names}}' | grep -q "^${PROXY_NAME}$"; then
+		echo -e "${GREEN}✓ Proxy is running${NC}"
+		echo ""
+		echo "Dashboard: http://localhost:8080"
+		echo ""
+		echo "Routed services:"
+
+		# Query Traefik API for routes (exclude internal Traefik routes)
+		ROUTES=$(curl -s http://localhost:8080/api/http/routers 2>/dev/null || echo "")
+
+		if [[ -n "$ROUTES" && "$ROUTES" != "[]" ]]; then
+			# Parse JSON to extract Host rules, excluding api@internal routes
+			# shellcheck disable=SC2016
+			HOSTS=$(echo "$ROUTES" |
+				sed 's/},/}\n/g' |
+				grep -v '@internal' |
+				grep -o 'Host(`[^`]*`)' |
+				sed 's/Host(`\([^`]*\)`)/  http:\/\/\1/' |
+				sort -u)
+
+			if [[ -n "$HOSTS" ]]; then
+				echo "$HOSTS"
+			else
+				echo "  (no services registered)"
+			fi
+		else
+			echo "  (no services registered)"
+		fi
+	else
+		echo -e "${RED}✗ Proxy is not running${NC}"
+		echo ""
+		echo "Run: dockroute start"
+	fi
+}
+
+cmd_logs() {
+	if docker ps --format '{{.Names}}' | grep -q "^${PROXY_NAME}$"; then
+		docker compose -f "$COMPOSE_FILE" -p dockroute logs -f
+	else
+		echo -e "${RED}Proxy is not running${NC}"
+		echo "Run: dockroute start"
+		exit 1
+	fi
+}
+
+cmd_ensure() {
+	# Silent start for use in scripts - only outputs if starting
+	if ! docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
+		docker network create "$NETWORK_NAME" >/dev/null
+	fi
+
+	if ! docker ps --format '{{.Names}}' | grep -q "^${PROXY_NAME}$"; then
+		echo "Starting dockroute..."
+		docker compose -f "$COMPOSE_FILE" -p dockroute up -d >/dev/null
+		echo -e "${GREEN}✓ Proxy started${NC}"
+	fi
+}
+
+cmd_version() {
+	echo "dockroute v${VERSION}"
+}
+
+cmd_help() {
+	echo "dockroute - Local development proxy for Docker"
+	echo ""
+	echo "Eliminates port conflicts by routing via hostnames."
+	echo "Run multiple projects simultaneously, each accessible at:"
+	echo "  http://<projectname>.localhost"
+	echo ""
+	echo "Usage: dockroute <command>"
+	echo ""
+	echo "Commands:"
+	echo "  start     Start the proxy"
+	echo "  stop      Stop the proxy"
+	echo "  status    Show proxy status and routed services"
+	echo "  logs      Follow proxy logs"
+	echo "  ensure    Start proxy if not running (for scripts)"
+	echo "  version   Show version"
+	echo "  help      Show this help"
+	echo ""
+	echo "Project Setup:"
+	echo "  Add to your docker-compose.yml:"
+	echo ""
+	echo "    services:"
+	echo "      app:"
+	echo "        labels:"
+	echo "          - \"traefik.enable=true\""
+	echo "          - \"traefik.http.routers.myapp.rule=Host(\\\`myapp.localhost\\\`)\""
+	echo "          - \"traefik.http.services.myapp.loadbalancer.server.port=3000\""
+	echo "        networks:"
+	echo "          - proxy"
+	echo "          - default"
+	echo ""
+	echo "    networks:"
+	echo "      proxy:"
+	echo "        external: true"
+}
+
+case "${1:-}" in
+start) cmd_start ;;
+stop) cmd_stop ;;
+status) cmd_status ;;
+logs) cmd_logs ;;
+ensure) cmd_ensure ;;
+version) cmd_version ;;
+-v) cmd_version ;;
+--version) cmd_version ;;
+help) cmd_help ;;
+-h) cmd_help ;;
+--help) cmd_help ;;
+*) cmd_help ;;
+esac
