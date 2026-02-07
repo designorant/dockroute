@@ -9,19 +9,26 @@ Run multiple Docker projects simultaneously, each accessible via hostname:
 
 ## The Problem
 
-Running multiple Docker projects locally often causes port conflicts:
+Running multiple Docker projects locally causes port conflicts:
 ```
-Project A: localhost:3000 → container:3000
-Project B: localhost:3000 → CONFLICT ❌
+Error: Bind for 0.0.0.0:6379 failed: port is already allocated
+```
+
+This happens because each project's `docker-compose.yml` maps the same host ports:
+```
+Project A: localhost:3000, localhost:5432, localhost:6379
+Project B: localhost:3000, localhost:5432, localhost:6379 → CONFLICT ❌
 ```
 
 ## The Solution
 
-dockroute runs Traefik as a reverse proxy. Projects are routed by hostname instead of port:
+dockroute runs Traefik as a reverse proxy. Web services are routed by hostname instead of port, and databases/caches stay internal to Docker's network — no exposed ports, no conflicts:
 ```
 Project A: myapp.localhost → Traefik → container_a:3000
 Project B: api.localhost   → Traefik → container_b:3000
 ```
+
+Databases and caches (Postgres, Redis, etc.) don't need `ports:` mappings at all — your app connects to them over Docker's internal network using the service name (e.g., `redis:6379`). No host port, no conflict.
 
 Both projects run simultaneously with no conflicts.
 
@@ -70,6 +77,9 @@ dockroute stop
 
 Update your project's `docker-compose.yml`:
 
+1. **Web services**: Replace `ports:` with Traefik labels and add the `proxy` network
+2. **Databases/caches**: Remove `ports:` entirely — your app already connects via Docker's internal network
+
 ```yaml
 services:
   app:
@@ -85,7 +95,13 @@ services:
 
   db:
     image: postgres:16
-    # No ports needed - app connects via Docker network
+    # Remove ports: - "5432:5432"
+    # App connects as postgres://user:pass@db:5432/mydb
+
+  redis:
+    image: redis
+    # Remove ports: - "6379:6379"
+    # App connects as redis://redis:6379
 
 networks:
   proxy:
@@ -163,6 +179,15 @@ Everything routes through port 80 using hostnames — no port conflicts, no port
 | Redis | `localhost:6379` | Not exposed (internal) |
 
 Databases and caches don't need exposed ports — your app connects via Docker's internal network using the service name (e.g., `postgres://user:pass@db:5432/mydb`).
+
+If you need to connect to a database from the host (e.g., using TablePlus or RedisInsight), you can use `docker exec` or expose a unique port per project to avoid conflicts:
+
+```yaml
+# Project A                    # Project B
+redis:                         redis:
+  ports:                         ports:
+    - "16379:6379"                 - "26379:6379"
+```
 
 The dashboard is available at `dockroute.localhost`.
 
