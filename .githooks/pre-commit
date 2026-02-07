@@ -1,0 +1,49 @@
+#!/bin/bash
+set -e
+
+# Mirrors CI: shellcheck + shfmt on staged shell scripts.
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+SHELL_FILES=""
+
+for file in $STAGED; do
+	case "$file" in
+	bin/*) SHELL_FILES="$SHELL_FILES $file" ;;
+	esac
+done
+
+if [[ -z "$SHELL_FILES" ]]; then
+	exit 0
+fi
+
+ERRORS=0
+
+# shellcheck
+if command -v shellcheck &>/dev/null; then
+	for file in $SHELL_FILES; do
+		if ! git show ":$file" | shellcheck -; then
+			echo "error: shellcheck failed on $file"
+			ERRORS=$((ERRORS + 1))
+		fi
+	done
+else
+	echo "warning: shellcheck not found, skipping (brew install shellcheck)"
+fi
+
+# shfmt
+if command -v shfmt &>/dev/null; then
+	for file in $SHELL_FILES; do
+		if ! git show ":$file" | shfmt -d; then
+			echo "error: shfmt failed on $file"
+			ERRORS=$((ERRORS + 1))
+		fi
+	done
+else
+	echo "warning: shfmt not found, skipping (brew install shfmt)"
+fi
+
+if [[ $ERRORS -gt 0 ]]; then
+	echo ""
+	echo "$ERRORS problem(s) found. Fix before committing."
+	exit 1
+fi
