@@ -243,4 +243,4 @@ services:
 
 ## License
 
-MIT
+[MIT](LICENSE) © [Michał Ordon](https://github.com/designorant)
