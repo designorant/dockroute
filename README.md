@@ -56,9 +56,9 @@ dockroute start
 dockroute status
 ```
 
-### View Traefik dashboard
+### View dashboard
 
-Open http://localhost:8080 to see all routed services.
+Open http://dockroute.localhost to see all routed services.
 
 ### Stop the proxy
 
@@ -164,7 +164,7 @@ Everything routes through port 80 using hostnames — no port conflicts, no port
 
 Databases and caches don't need exposed ports — your app connects via Docker's internal network using the service name (e.g., `postgres://user:pass@db:5432/mydb`).
 
-The dashboard is available at `localhost:8080`.
+The dashboard is available at `dockroute.localhost`.
 
 ## Extending with Custom Entrypoints
 
@@ -200,7 +200,7 @@ services:
 ## How It Works
 
 1. **Shared network**: All projects connect to a `proxy` network
-2. **Single proxy**: Traefik listens on port 80 (and 8080 for dashboard)
+2. **Single proxy**: Traefik listens on port 80 (dashboard at `dockroute.localhost`)
 3. **Label-based routing**: Traefik reads container labels to configure routes
 4. **Hostname resolution**: `.localhost` domains resolve to 127.0.0.1 automatically
 

@@ -4,7 +4,7 @@ set -e
 # dockroute - Local development proxy for Docker
 # Eliminates port conflicts by routing via hostnames
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 PROXY_NAME="dockroute-traefik"
 NETWORK_NAME="proxy"
 
@@ -40,7 +40,7 @@ cmd_start() {
 		docker compose -f "$COMPOSE_FILE" -p dockroute up -d
 		echo ""
 		echo -e "${GREEN}✓ Proxy running${NC}"
-		echo "  Dashboard: http://localhost:8080"
+		echo "  Dashboard: http://dockroute.localhost"
 		echo "  Projects:  http://<project>.localhost"
 	else
 		echo -e "${GREEN}✓ Proxy already running${NC}"
@@ -65,12 +65,12 @@ cmd_status() {
 	if docker ps --format '{{.Names}}' | grep -q "^${PROXY_NAME}$"; then
 		echo -e "${GREEN}✓ Proxy is running${NC}"
 		echo ""
-		echo "Dashboard: http://localhost:8080"
+		echo "Dashboard: http://dockroute.localhost"
 		echo ""
 		echo "Routed services:"
 
 		# Query Traefik API for routes (exclude internal Traefik routes)
-		ROUTES=$(curl -s http://localhost:8080/api/http/routers 2>/dev/null || echo "")
+		ROUTES=$(curl -s http://dockroute.localhost/api/http/routers 2>/dev/null || echo "")
 
 		if [[ -n "$ROUTES" && "$ROUTES" != "[]" ]]; then
 			# Parse JSON to extract Host rules, excluding api@internal routes

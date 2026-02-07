@@ -9,10 +9,13 @@ services:
       - "--providers.docker.exposedbydefault=false"
       - "--entrypoints.web.address=:80"
       - "--entrypoints.websecure.address=:443"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dockroute.rule=Host(`dockroute.localhost`)"
+      - "traefik.http.services.dockroute.loadbalancer.server.port=8080"
     ports:
       - "80:80"
       - "443:443"
-      - "8080:8080"  # Dashboard
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
