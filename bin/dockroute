@@ -4,9 +4,9 @@ set -e
 # dockroute - Local development proxy for Docker
 # Eliminates port conflicts by routing via hostnames
 
-VERSION="1.1.0"
+VERSION="2.0.0"
 PROXY_NAME="dockroute-traefik"
-NETWORK_NAME="proxy"
+NETWORK_NAME="dockroute"
 
 # Determine compose file location
 # Priority: 1) Script's local share dir, 2) Homebrew share dir
@@ -21,13 +21,50 @@ else
 	exit 1
 fi
 
+# v1.x used "proxy" as the network name — migrate to "dockroute"
+OLD_NETWORK_NAME="proxy"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m' # No Color
 
+migrate_network() {
+	# Skip if old network doesn't exist
+	if ! docker network inspect "$OLD_NETWORK_NAME" >/dev/null 2>&1; then
+		return
+	fi
+
+	# Skip if new network already exists (migration already done)
+	if docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
+		echo -e "${YELLOW}Note: Old '$OLD_NETWORK_NAME' network still exists. Remove it with: docker network rm $OLD_NETWORK_NAME${NC}"
+		return
+	fi
+
+	echo -e "${YELLOW}Migrating network '$OLD_NETWORK_NAME' → '$NETWORK_NAME'...${NC}"
+
+	# Check if any containers are still connected
+	CONNECTED=$(docker network inspect "$OLD_NETWORK_NAME" --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null | xargs)
+	if [[ -n "$CONNECTED" ]]; then
+		echo -e "${RED}Cannot migrate: containers are still connected to '$OLD_NETWORK_NAME':${NC}"
+		echo "  $CONNECTED"
+		echo ""
+		echo "To migrate:"
+		echo "  1. Stop those projects (docker compose down)"
+		echo "  2. Update their docker-compose.yml: rename network 'proxy' → 'dockroute'"
+		echo "  3. Run: docker network rm $OLD_NETWORK_NAME"
+		echo "  4. Re-run: dockroute start"
+		exit 1
+	fi
+
+	docker network rm "$OLD_NETWORK_NAME" >/dev/null
+	echo -e "${GREEN}✓ Removed old '$OLD_NETWORK_NAME' network${NC}"
+}
+
 cmd_start() {
+	migrate_network
+
 	# Create network if needed
 	if ! docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
 		echo "Creating Docker network '$NETWORK_NAME'..."
@@ -109,6 +146,8 @@ cmd_logs() {
 
 cmd_ensure() {
 	# Silent start for use in scripts - only outputs if starting
+	migrate_network
+
 	if ! docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
 		docker network create "$NETWORK_NAME" >/dev/null
 	fi
@@ -152,11 +191,11 @@ cmd_help() {
 	echo "          - \"traefik.http.routers.myapp.rule=Host(\\\`myapp.localhost\\\`)\""
 	echo "          - \"traefik.http.services.myapp.loadbalancer.server.port=3000\""
 	echo "        networks:"
-	echo "          - proxy"
+	echo "          - dockroute"
 	echo "          - default"
 	echo ""
 	echo "    networks:"
-	echo "      proxy:"
+	echo "      dockroute:"
 	echo "        external: true"
 }
 

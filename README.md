@@ -77,7 +77,7 @@ dockroute stop
 
 Update your project's `docker-compose.yml`:
 
-1. **Web services**: Replace `ports:` with Traefik labels and add the `proxy` network
+1. **Web services**: Replace `ports:` with Traefik labels and add the `dockroute` network
 2. **Databases/caches**: Remove `ports:` entirely — your app already connects via Docker's internal network
 
 ```yaml
@@ -89,7 +89,7 @@ services:
       - "traefik.http.routers.myapp.rule=Host(`myapp.localhost`)"
       - "traefik.http.services.myapp.loadbalancer.server.port=3000"
     networks:
-      - proxy
+      - dockroute
       - default
     # Remove ports: - "3000:3000"
 
@@ -104,7 +104,7 @@ services:
     # App connects as redis://redis:6379
 
 networks:
-  proxy:
+  dockroute:
     external: true
 ```
 
@@ -128,7 +128,7 @@ services:
       - "traefik.http.routers.myapp-ws.rule=Host(`ws.myapp.localhost`)"
       - "traefik.http.services.myapp-ws.loadbalancer.server.port=6001"
     networks:
-      - proxy
+      - dockroute
 ```
 
 Access at: `ws.myapp.localhost` (no port needed)
@@ -224,7 +224,7 @@ services:
 
 ## How It Works
 
-1. **Shared network**: All projects connect to a `proxy` network
+1. **Shared network**: All projects connect to a `dockroute` network
 2. **Single proxy**: Traefik listens on port 80 (dashboard at `dockroute.localhost`)
 3. **Label-based routing**: Traefik reads container labels to configure routes
 4. **Hostname resolution**: `.localhost` domains resolve to 127.0.0.1 automatically
