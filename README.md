@@ -200,13 +200,27 @@ Everything routes through port 80 using hostnames — no port conflicts, no port
 
 Databases and caches don't need exposed ports — your app connects via Docker's internal network using the service name (e.g., `postgres://user:pass@db:5432/mydb`).
 
-If you need to connect to a database from the host (e.g., using TablePlus or RedisInsight), you can use `docker exec` or expose a unique port per project to avoid conflicts:
+If you need host access for tools like Drizzle Kit, TablePlus, or RedisInsight, the simplest option is `docker compose exec`:
+
+```bash
+docker compose exec db psql -U postgres
+docker compose exec redis redis-cli
+```
+
+For GUI tools that require a host port, use an environment variable so each project can set its own port in `.env`:
 
 ```yaml
-# Project A                    # Project B
-redis:                         redis:
-  ports:                         ports:
-    - "16379:6379"                 - "26379:6379"
+# docker-compose.yml
+services:
+  db:
+    image: postgres:16
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+```
+
+```bash
+# .env (gitignored, set once per project)
+POSTGRES_PORT=5433
 ```
 
 The dashboard is available at `dockroute.localhost`.
@@ -261,6 +275,26 @@ services:
 | `dockroute ensure` | Start if not running (for scripts) |
 | `dockroute version` | Show version |
 | `dockroute help` | Show help |
+
+## For AI Coding Agents
+
+If you use AI coding agents (Claude Code, Cursor, Copilot, Codex, etc.), add the following to your project's `AGENTS.md` file so agents automatically follow dockroute conventions when working with your `docker-compose.yml`:
+
+````markdown
+## Docker (dockroute)
+
+This project uses [dockroute](https://github.com/designorant/dockroute) for local Docker networking. Services are accessible at `http://<prefix>.localhost`.
+
+### Rules for `docker-compose.yml`
+
+- **Web services**: Replace `ports:` with Traefik labels (`traefik.enable=true`, router rule, loadbalancer port). Add both `dockroute` and `default` networks. Use the project directory name as the `<prefix>`.
+- **Internal services** (databases, caches): Remove `ports:` — apps connect via Docker's internal network (e.g., `redis://redis:6379`). For host GUI access, use env var pattern: `"${POSTGRES_PORT:-5432}:5432"`.
+- **Supporting services** (Mailhog, MinIO, etc.): Route through Traefik with flat subdomain: `<prefix>-<service>.localhost` (NOT `<service>.<prefix>.localhost`).
+- **WebSocket services**: Use `<prefix>-ws.localhost` as hostname.
+- **Naming**: Router names and hostnames must be project-scoped (`myapp`, not `app`).
+- **Network**: Declare `dockroute` as external.
+- **Label format**: `"traefik.http.routers.<prefix>.rule=Host(`<prefix>.localhost`)"` (double-quoted, backtick hostnames).
+````
 
 ## License
 
