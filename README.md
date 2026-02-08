@@ -4,8 +4,8 @@ Local development proxy for Docker — no more port conflicts.
 
 Run multiple Docker projects simultaneously, each accessible via hostname:
 - `http://myapp.localhost`
-- `http://api.localhost`
-- `http://dashboard.localhost`
+- `http://myapp-api.localhost`
+- `http://myapp-admin.localhost`
 
 ## The Problem
 
@@ -24,8 +24,8 @@ Project B: localhost:3000, localhost:5432, localhost:6379 → CONFLICT ❌
 
 dockroute runs Traefik as a reverse proxy. Web services are routed by hostname instead of port, and databases/caches stay internal to Docker's network — no exposed ports, no conflicts:
 ```
-Project A: myapp.localhost → Traefik → container_a:3000
-Project B: api.localhost   → Traefik → container_b:3000
+Project A: myapp.localhost      → Traefik → container_a:3000
+Project B: storefront.localhost → Traefik → container_b:3000
 ```
 
 Databases and caches (Postgres, Redis, etc.) don't need `ports:` mappings at all — your app connects to them over Docker's internal network using the service name (e.g., `redis:6379`). No host port, no conflict.
