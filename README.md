@@ -133,7 +133,7 @@ labels:
   - "traefik.http.services.myapp.loadbalancer.server.port=3000"
 ```
 
-This also applies to supporting services like Mailhog or SonarQube — use `mail.myapp.localhost` instead of `mail.localhost`, and `sonarqube.myapp.localhost` instead of `sonarqube.localhost`.
+This also applies to supporting services like Mailhog or SonarQube — use `myapp-mail.localhost` instead of `mail.localhost`, and `myapp-sonarqube.localhost` instead of `sonarqube.localhost`.
 
 ## WebSocket Support
 
@@ -145,13 +145,13 @@ services:
     image: quay.io/soketi/soketi:1.6-16-debian
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.myapp-ws.rule=Host(`ws.myapp.localhost`)"
+      - "traefik.http.routers.myapp-ws.rule=Host(`myapp-ws.localhost`)"
       - "traefik.http.services.myapp-ws.loadbalancer.server.port=6001"
     networks:
       - dockroute
 ```
 
-Access at: `ws.myapp.localhost` (no port needed)
+Access at: `myapp-ws.localhost` (no port needed)
 
 ## Mise Integration
 
@@ -193,8 +193,8 @@ Everything routes through port 80 using hostnames — no port conflicts, no port
 | Service | Before | After |
 |---------|--------|-------|
 | Web app | `localhost:3000` | `myapp.localhost` |
-| WebSockets | `localhost:6001` | `ws.myapp.localhost` |
-| Mailhog | `localhost:8025` | `mail.myapp.localhost` |
+| WebSockets | `localhost:6001` | `myapp-ws.localhost` |
+| Mailhog | `localhost:8025` | `myapp-mail.localhost` |
 | Database | `localhost:5432` | Not exposed (internal) |
 | Redis | `localhost:6379` | Not exposed (internal) |
 
