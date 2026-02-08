@@ -21,6 +21,7 @@ Local development proxy for Docker that eliminates port conflicts by routing via
 - Shell scripts are checked by **shellcheck** and formatted by **shfmt** (pre-commit hook in `.githooks/pre-commit`)
 - Indentation: tabs (enforced by shfmt)
 - CI mirrors the pre-commit checks (`.github/workflows/test.yml`)
+- `dockroute check [path]` — lints a compose file against dockroute conventions (missing labels, exposed ports, network issues). Run it after modifying any project's `docker-compose.yml`.
 
 ## Docker Compose conventions for projects using dockroute
 

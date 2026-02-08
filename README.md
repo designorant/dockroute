@@ -115,6 +115,19 @@ docker compose up -d
 
 Access at: http://myapp.localhost
 
+## Checking Your Configuration
+
+Run `dockroute check` in your project directory to verify your `docker-compose.yml` follows dockroute conventions:
+
+```bash
+cd ~/projects/myapp
+dockroute check
+```
+
+It checks for common issues — missing Traefik labels, exposed database ports, missing network declarations, generic router names, and nested subdomains — and prints a ready-to-paste suggestion block with the fixes.
+
+Exits with code 0 when all checks pass, 1 when issues are found. You can pass an explicit path: `dockroute check path/to/docker-compose.yml`.
+
 ## Running Multiple Projects
 
 Each Docker Compose project has its own `default` network. Services like `db` and `redis` that stay on this network are automatically isolated — `redis://redis:6379` in Project A connects to Project A's Redis, not Project B's, even with identical service names. No changes needed.
@@ -271,6 +284,7 @@ services:
 | `dockroute start` | Start the proxy |
 | `dockroute stop` | Stop the proxy |
 | `dockroute status` | Show status and routed services |
+| `dockroute check [path]` | Check a compose file for dockroute issues |
 | `dockroute logs` | Follow proxy logs |
 | `dockroute ensure` | Start if not running (for scripts) |
 | `dockroute version` | Show version |

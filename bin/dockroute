@@ -4,7 +4,7 @@ set -e
 # dockroute - Local development proxy for Docker
 # Eliminates port conflicts by routing via hostnames
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 PROXY_NAME="dockroute-traefik"
 NETWORK_NAME="dockroute"
 
@@ -159,6 +159,534 @@ cmd_ensure() {
 	fi
 }
 
+cmd_check() {
+	local target="${2:-}"
+	local compose_file=""
+
+	# Find compose file
+	if [[ -n "$target" ]]; then
+		if [[ -f "$target" ]]; then
+			compose_file="$target"
+		else
+			echo -e "${RED}Error: File not found: $target${NC}"
+			exit 1
+		fi
+	else
+		for name in docker-compose.yml compose.yml docker-compose.yaml compose.yaml; do
+			if [[ -f "$name" ]]; then
+				compose_file="$name"
+				break
+			fi
+		done
+		if [[ -z "$compose_file" ]]; then
+			echo -e "${RED}Error: No compose file found${NC}"
+			echo "Tried: docker-compose.yml, compose.yml, docker-compose.yaml, compose.yaml"
+			echo "Usage: dockroute check [path]"
+			exit 1
+		fi
+	fi
+
+	# Derive project prefix from directory name
+	local project_dir
+	project_dir="$(cd "$(dirname "$compose_file")" && basename "$(pwd)")"
+	local prefix
+	prefix="$(echo "$project_dir" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')"
+
+	echo "Checking $compose_file (prefix: $prefix)..."
+	echo ""
+
+	# Normalize compose file via docker compose config
+	local config
+	if ! config=$(docker compose -f "$compose_file" config 2>&1); then
+		echo -e "${RED}Error: Failed to parse $compose_file${NC}"
+		echo "$config"
+		exit 1
+	fi
+
+	# --- Helpers for Bash 3 compatible key-value storage ---
+	# Uses parallel arrays instead of associative arrays
+	local _keys=()
+	local _vals=()
+
+	_kv_set() {
+		local key="$1" val="$2" i
+		for i in "${!_keys[@]}"; do
+			if [[ "${_keys[i]}" == "$key" ]]; then
+				_vals[i]="$val"
+				return
+			fi
+		done
+		_keys+=("$key")
+		_vals+=("$val")
+	}
+
+	_kv_get() {
+		local key="$1" i
+		for i in "${!_keys[@]}"; do
+			if [[ "${_keys[$i]}" == "$key" ]]; then
+				echo "${_vals[$i]}"
+				return
+			fi
+		done
+	}
+
+	_kv_append() {
+		local key="$1" val="$2" i
+		for i in "${!_keys[@]}"; do
+			if [[ "${_keys[i]}" == "$key" ]]; then
+				_vals[i]="${_vals[i]}${val}"
+				return
+			fi
+		done
+		_keys+=("$key")
+		_vals+=("$val")
+	}
+
+	# Parse normalized YAML with a line-by-line state machine
+	local errors=0
+	local warnings=0
+	local suggestions=0
+	local services=()
+	local has_dockroute_network=false
+
+	local section=""
+	local current_svc=""
+	local in_labels=false
+	local in_ports=false
+	local in_networks=false
+	local top_networks=false
+	# Port parsing state: docker compose config outputs structured port blocks
+	#   - mode: ingress
+	#     target: 3000
+	#     published: "3000"
+	#     protocol: tcp
+	local port_target=""
+	local port_published=""
+
+	while IFS= read -r line; do
+		# Top-level sections (no leading whitespace)
+		if [[ "$line" =~ ^[a-z] ]]; then
+			# Flush pending port block before leaving services section
+			if [[ "$in_ports" == true && -n "$port_target" && -n "$current_svc" ]]; then
+				_kv_append "${current_svc}.ports" "${port_published}:${port_target}"$'\n'
+				port_target=""
+				port_published=""
+			fi
+			in_labels=false
+			in_ports=false
+			in_networks=false
+			current_svc=""
+			if [[ "$line" == "services:" ]]; then
+				section="services"
+				top_networks=false
+			elif [[ "$line" == "networks:" ]]; then
+				section="networks"
+				top_networks=true
+			else
+				section=""
+				top_networks=false
+			fi
+			continue
+		fi
+
+		# Top-level network: check for dockroute external
+		if [[ "$top_networks" == true ]]; then
+			if [[ "$line" =~ ^\ \ ([a-zA-Z0-9_-]+): ]]; then
+				current_svc="${line##  }"
+				current_svc="${current_svc%%:*}"
+			elif [[ "$current_svc" == "dockroute" && "$line" =~ "external: true" ]]; then
+				has_dockroute_network=true
+			fi
+			continue
+		fi
+
+		# Inside services section
+		if [[ "$section" != "services" ]]; then
+			continue
+		fi
+
+		# Service-level key (2-space indent in normalized output)
+		if [[ "$line" =~ ^\ \ ([a-zA-Z0-9_-]+):$ ]]; then
+			# Flush pending port block from previous service
+			if [[ "$in_ports" == true && -n "$port_target" && -n "$current_svc" ]]; then
+				_kv_append "${current_svc}.ports" "${port_published}:${port_target}"$'\n'
+				port_target=""
+				port_published=""
+			fi
+			current_svc="${BASH_REMATCH[1]}"
+			services+=("$current_svc")
+			_kv_set "${current_svc}.image" ""
+			_kv_set "${current_svc}.ports" ""
+			_kv_set "${current_svc}.has_traefik" "false"
+			_kv_set "${current_svc}.traefik_labels" ""
+			_kv_set "${current_svc}.networks" ""
+			_kv_set "${current_svc}.has_build" "false"
+			in_labels=false
+			in_ports=false
+			in_networks=false
+			continue
+		fi
+
+		[[ -z "$current_svc" ]] && continue
+
+		# Property-level key (4-space indent)
+		if [[ "$line" =~ ^\ {4}([a-z_]+): ]]; then
+			local prop="${BASH_REMATCH[1]}"
+			# Flush pending port block before leaving ports section
+			if [[ "$in_ports" == true && -n "$port_target" ]]; then
+				_kv_append "${current_svc}.ports" "${port_published}:${port_target}"$'\n'
+				port_target=""
+				port_published=""
+			fi
+			in_labels=false
+			in_ports=false
+			in_networks=false
+			case "$prop" in
+			image)
+				_kv_set "${current_svc}.image" "${line#*: }"
+				;;
+			labels) in_labels=true ;;
+			ports) in_ports=true ;;
+			networks) in_networks=true ;;
+			build)
+				_kv_set "${current_svc}.has_build" "true"
+				;;
+			esac
+			continue
+		fi
+
+		# Labels: docker compose config outputs labels as a map (key: value),
+		# not a list. e.g., "      traefik.enable: "true""
+		if [[ "$in_labels" == true && "$line" =~ ^\ {6}([a-zA-Z0-9._-]+):\ (.+) ]]; then
+			local lbl_key="${BASH_REMATCH[1]}"
+			local lbl_val="${BASH_REMATCH[2]}"
+			lbl_val="${lbl_val%\"}"
+			lbl_val="${lbl_val#\"}"
+			if [[ "$lbl_key" == "traefik.enable" && "$lbl_val" == "true" ]]; then
+				_kv_set "${current_svc}.has_traefik" "true"
+			fi
+			_kv_append "${current_svc}.traefik_labels" "${lbl_key}=${lbl_val}"$'\n'
+		fi
+
+		# Ports: structured blocks from docker compose config
+		# Each port entry starts with "- mode:" and has target/published on following lines
+		if [[ "$in_ports" == true ]]; then
+			if [[ "$line" =~ ^\ +- ]]; then
+				# New port block — save previous if complete
+				if [[ -n "$port_target" ]]; then
+					_kv_append "${current_svc}.ports" "${port_published}:${port_target}"$'\n'
+				fi
+				port_target=""
+				port_published=""
+			elif [[ "$line" =~ ^\ +target:\ (.+) ]]; then
+				port_target="${BASH_REMATCH[1]}"
+			elif [[ "$line" =~ ^\ +published:\ (.+) ]]; then
+				port_published="${BASH_REMATCH[1]}"
+				port_published="${port_published%\"}"
+				port_published="${port_published#\"}"
+			fi
+		fi
+
+		# Networks: key-value pairs like "dockroute: null" or "default: null"
+		if [[ "$in_networks" == true && "$line" =~ ^\ {6}([a-zA-Z0-9_-]+): ]]; then
+			_kv_append "${current_svc}.networks" "${BASH_REMATCH[1]} "
+		fi
+	done <<<"$config"
+
+	# Flush last port block if any
+	if [[ "$in_ports" == true && -n "$port_target" ]]; then
+		_kv_append "${current_svc}.ports" "${port_published}:${port_target}"$'\n'
+	fi
+
+	# Fallback: check raw compose file for dockroute network declaration
+	# docker compose config strips unused external networks from output
+	if [[ "$has_dockroute_network" == false ]]; then
+		if grep -q 'dockroute' "$compose_file" 2>/dev/null &&
+			grep -q 'external' "$compose_file" 2>/dev/null; then
+			has_dockroute_network=true
+		fi
+	fi
+
+	# Also check raw file for env var port patterns (docker compose config resolves them)
+	local raw_content
+	raw_content=$(cat "$compose_file")
+
+	# Classify services
+	local db_pattern='(postgres|mysql|mariadb|redis|memcached|mongo|elasticsearch|rabbitmq|mssql|valkey)'
+	local support_pattern='(mailhog|mailpit|minio|adminer|phpmyadmin|pgadmin|redisinsight|soketi)'
+	local web_ports_pattern='(3000|8080|8000|4200|5173|5000|4000|8888|9000):'
+
+	for svc in "${services[@]}"; do
+		local img
+		img=$(_kv_get "${svc}.image")
+		if [[ "$img" =~ $db_pattern ]]; then
+			_kv_set "${svc}.type" "database"
+		elif [[ "$img" =~ $support_pattern ]]; then
+			_kv_set "${svc}.type" "support"
+		elif [[ "$(_kv_get "${svc}.has_traefik")" == true ]]; then
+			_kv_set "${svc}.type" "web"
+		elif [[ "$(_kv_get "${svc}.has_build")" == true ]]; then
+			_kv_set "${svc}.type" "web"
+		elif [[ "$(_kv_get "${svc}.ports")" =~ $web_ports_pattern ]]; then
+			_kv_set "${svc}.type" "web"
+		else
+			_kv_set "${svc}.type" "unknown"
+		fi
+	done
+
+	# Run checks per service
+	local need_suggestion=false
+
+	for svc in "${services[@]}"; do
+		local issues=""
+		local type
+		type=$(_kv_get "${svc}.type")
+		local has_ports=false
+		local has_traefik
+		has_traefik=$(_kv_get "${svc}.has_traefik")
+		local on_dockroute=false
+		local svc_ports_val
+		svc_ports_val=$(_kv_get "${svc}.ports")
+		local svc_nets_val
+		svc_nets_val=$(_kv_get "${svc}.networks")
+
+		[[ -n "$svc_ports_val" ]] && has_ports=true
+		[[ "$svc_nets_val" == *dockroute* ]] && on_dockroute=true
+
+		# W1: Web/support service has ports but no Traefik labels
+		if [[ ("$type" == "web" || "$type" == "support") && "$has_ports" == true && "$has_traefik" == false ]]; then
+			local port_list
+			port_list=$(echo -n "$svc_ports_val" | tr '\n' ', ' | sed 's/,$//')
+			issues+="${RED}✗${NC} Has ports [$port_list] but no Traefik labels"$'\n'
+			warnings=$((warnings + 1))
+			need_suggestion=true
+		fi
+
+		# W2: Service has Traefik labels AND ports simultaneously
+		if [[ "$has_traefik" == true && "$has_ports" == true ]]; then
+			issues+="${YELLOW}!${NC} Has Traefik labels but still exposes ports — remove ports"$'\n'
+			warnings=$((warnings + 1))
+			need_suggestion=true
+		fi
+
+		# W3: Service has Traefik labels but not on dockroute network
+		if [[ "$has_traefik" == true && "$on_dockroute" == false ]]; then
+			issues+="${RED}✗${NC} Has Traefik labels but missing dockroute network"$'\n'
+			errors=$((errors + 1))
+			need_suggestion=true
+		fi
+
+		# D1: Database/cache exposes ports
+		if [[ "$type" == "database" && "$has_ports" == true ]]; then
+			# Check raw compose file for env var pattern (docker compose config resolves variables)
+			local uses_env_var=false
+			# shellcheck disable=SC2016
+			if echo "$raw_content" | grep -A5 "^  ${svc}:" | grep -q '${'; then
+				uses_env_var=true
+			fi
+			if [[ "$uses_env_var" == true ]]; then
+				issues+="${GREEN}✓${NC} Uses env var pattern for port access"$'\n'
+			else
+				local port_list
+				port_list=$(echo -n "$svc_ports_val" | tr '\n' ', ' | sed 's/,$//')
+				local svc_name
+				svc_name=$(_kv_get "${svc}.image")
+				svc_name="${svc_name%%:*}"
+				svc_name="${svc_name##*/}"
+				issues+="${YELLOW}!${NC} Exposes port [$port_list] — remove ports (use ${svc_name}://${svc}:${port_list##*:} internally)"$'\n'
+				suggestions=$((suggestions + 1))
+				need_suggestion=true
+			fi
+		fi
+
+		# R1: Router name is generic — collision risk
+		if [[ "$has_traefik" == true ]]; then
+			local labels
+			labels=$(_kv_get "${svc}.traefik_labels")
+			local router_name=""
+			while IFS= read -r lbl; do
+				if [[ "$lbl" =~ traefik\.http\.routers\.([^.]+)\. ]]; then
+					router_name="${BASH_REMATCH[1]}"
+					break
+				fi
+			done <<<"$labels"
+			if [[ -n "$router_name" ]]; then
+				case "$router_name" in
+				app | web | api | server | frontend | backend | service)
+					issues+="${YELLOW}!${NC} Router name '$router_name' is generic — use '${prefix}' or '${prefix}-${svc}' to avoid collisions"$'\n'
+					warnings=$((warnings + 1))
+					;;
+				esac
+			fi
+		fi
+
+		# R2: Hostname uses nested subdomain instead of flat
+		if [[ "$has_traefik" == true ]]; then
+			local labels
+			labels=$(_kv_get "${svc}.traefik_labels")
+			# Store regex in variable — backticks in [[ =~ ]] are interpreted as command substitution
+			# shellcheck disable=SC2016
+			local nested_re='Host\(`([^.]+)\.([^.]+)\.localhost`\)'
+			while IFS= read -r lbl; do
+				if [[ "$lbl" =~ $nested_re ]]; then
+					local sub="${BASH_REMATCH[1]}"
+					local parent="${BASH_REMATCH[2]}"
+					issues+="${YELLOW}!${NC} Nested subdomain '${sub}.${parent}.localhost' — use '${parent}-${sub}.localhost' instead"$'\n'
+					warnings=$((warnings + 1))
+				fi
+			done <<<"$labels"
+		fi
+
+		_kv_set "${svc}.issues" "$issues"
+	done
+
+	# N1: Missing dockroute network declaration
+	local network_error=false
+	if [[ "$has_dockroute_network" == false ]]; then
+		network_error=true
+		errors=$((errors + 1))
+		need_suggestion=true
+	fi
+
+	# Print per-service results
+	for svc in "${services[@]}"; do
+		local issues
+		issues=$(_kv_get "${svc}.issues")
+		echo "  ${svc}:"
+		if [[ -n "$issues" ]]; then
+			while IFS= read -r issue; do
+				[[ -z "$issue" ]] && continue
+				echo -e "    ${issue}"
+			done <<<"$issues"
+		else
+			echo -e "    ${GREEN}✓${NC} No issues"
+		fi
+		echo ""
+	done
+
+	if [[ "$network_error" == true ]]; then
+		echo -e "  ${RED}✗${NC} Missing dockroute network declaration"
+		echo ""
+	fi
+
+	# Summary
+	local total=$((errors + warnings + suggestions))
+	if [[ $total -eq 0 ]]; then
+		echo -e "${GREEN}✓ All checks passed${NC}"
+		return 0
+	fi
+
+	local summary=""
+	[[ $errors -gt 0 ]] && summary+="$errors error(s)"
+	[[ $warnings -gt 0 ]] && {
+		[[ -n "$summary" ]] && summary+=", "
+		summary+="$warnings warning(s)"
+	}
+	[[ $suggestions -gt 0 ]] && {
+		[[ -n "$summary" ]] && summary+=", "
+		summary+="$suggestions suggestion(s)"
+	}
+	echo "Found $summary"
+
+	# Generate suggestion block
+	if [[ "$need_suggestion" == true ]]; then
+		echo ""
+		echo "Suggested dockroute configuration:"
+		echo "─────────────────────────────────────"
+		echo "services:"
+
+		for svc in "${services[@]}"; do
+			local type
+			type=$(_kv_get "${svc}.type")
+			local has_ports=false
+			local has_traefik
+			has_traefik=$(_kv_get "${svc}.has_traefik")
+			local on_dockroute=false
+			local svc_ports_val
+			svc_ports_val=$(_kv_get "${svc}.ports")
+			local svc_nets_val
+			svc_nets_val=$(_kv_get "${svc}.networks")
+			local issues
+			issues=$(_kv_get "${svc}.issues")
+
+			[[ -n "$svc_ports_val" ]] && has_ports=true
+			[[ "$svc_nets_val" == *dockroute* ]] && on_dockroute=true
+
+			# Skip services with no issues
+			if [[ -z "$issues" ]]; then
+				echo "  $svc:"
+				echo "    # ✓ No changes needed"
+				continue
+			fi
+
+			echo "  $svc:"
+			echo "    # ... your existing config ..."
+
+			# Suggest Traefik labels for web/support services without them
+			if [[ ("$type" == "web" || "$type" == "support") && "$has_traefik" == false ]]; then
+				local router_name="${prefix}"
+				[[ "$svc" != "app" && "$svc" != "web" ]] && router_name="${prefix}-${svc}"
+				local hostname="${router_name}.localhost"
+
+				# Detect the container port from existing port mapping
+				local container_port=""
+				if [[ "$has_ports" == true ]]; then
+					local first_port
+					first_port=$(echo "$svc_ports_val" | head -1)
+					container_port="${first_port##*:}"
+				fi
+
+				echo "    labels:"
+				echo "      - \"traefik.enable=true\""
+				echo "      - \"traefik.http.routers.${router_name}.rule=Host(\`${hostname}\`)\""
+				if [[ -n "$container_port" ]]; then
+					echo "      - \"traefik.http.services.${router_name}.loadbalancer.server.port=${container_port}\""
+				else
+					echo "      - \"traefik.http.services.${router_name}.loadbalancer.server.port=<port>\""
+				fi
+				echo "    networks:"
+				echo "      - dockroute"
+				echo "      - default"
+			fi
+
+			# Suggest network if has Traefik but missing dockroute
+			if [[ "$has_traefik" == true && "$on_dockroute" == false ]]; then
+				echo "    networks:"
+				echo "      - dockroute"
+				echo "      - default"
+			fi
+
+			# Suggest removing ports
+			if [[ "$has_ports" == true ]]; then
+				if [[ "$type" == "database" ]]; then
+					local svc_name
+					svc_name=$(_kv_get "${svc}.image")
+					svc_name="${svc_name%%:*}"
+					svc_name="${svc_name##*/}"
+					local first_port
+					first_port=$(echo "$svc_ports_val" | head -1)
+					local container_port="${first_port##*:}"
+					echo "    # Remove: ports"
+					echo "    # Connect internally: ${svc_name}://${svc}:${container_port}"
+				elif [[ "$has_traefik" == true || "$type" == "web" || "$type" == "support" ]]; then
+					echo "    # Remove: ports"
+				fi
+			fi
+		done
+
+		if [[ "$network_error" == true ]]; then
+			echo ""
+			echo "networks:"
+			echo "  dockroute:"
+			echo "    external: true"
+		fi
+
+		echo "─────────────────────────────────────"
+	fi
+
+	return 1
+}
+
 cmd_version() {
 	echo "dockroute v${VERSION}"
 }
@@ -176,6 +704,7 @@ cmd_help() {
 	echo "  start     Start the proxy"
 	echo "  stop      Stop the proxy"
 	echo "  status    Show proxy status and routed services"
+	echo "  check     Check a compose file for dockroute issues"
 	echo "  logs      Follow proxy logs"
 	echo "  ensure    Start proxy if not running (for scripts)"
 	echo "  version   Show version"
@@ -203,6 +732,7 @@ case "${1:-}" in
 start) cmd_start ;;
 stop) cmd_stop ;;
 status) cmd_status ;;
+check) cmd_check "$@" ;;
 logs) cmd_logs ;;
 ensure) cmd_ensure ;;
 version) cmd_version ;;
