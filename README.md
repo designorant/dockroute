@@ -115,6 +115,26 @@ docker compose up -d
 
 Access at: http://myapp.localhost
 
+## Running Multiple Projects
+
+Each Docker Compose project has its own `default` network. Services like `db` and `redis` that stay on this network are automatically isolated — `redis://redis:6379` in Project A connects to Project A's Redis, not Project B's, even with identical service names. No changes needed.
+
+Services exposed through Traefik join the shared `dockroute` network where both router names and hostnames must be globally unique. Prefix them with your project name:
+
+```yaml
+# Ambiguous — will collide with other projects using the same names
+labels:
+  - "traefik.http.routers.app.rule=Host(`app.localhost`)"
+  - "traefik.http.services.app.loadbalancer.server.port=3000"
+
+# Project-scoped — no conflicts
+labels:
+  - "traefik.http.routers.myapp.rule=Host(`myapp.localhost`)"
+  - "traefik.http.services.myapp.loadbalancer.server.port=3000"
+```
+
+This also applies to supporting services like Mailhog or SonarQube — use `mail.myapp.localhost` instead of `mail.localhost`, and `sonarqube.myapp.localhost` instead of `sonarqube.localhost`.
+
 ## WebSocket Support
 
 WebSockets work over port 80 using hostname routing:
@@ -228,6 +248,7 @@ services:
 2. **Single proxy**: Traefik listens on port 80 (dashboard at `dockroute.localhost`)
 3. **Label-based routing**: Traefik reads container labels to configure routes
 4. **Hostname resolution**: `.localhost` domains resolve to 127.0.0.1 automatically
+5. **Project isolation**: Each project's `default` network keeps internal services separated; only Traefik-labeled services share the `dockroute` network
 
 ## Commands
 
