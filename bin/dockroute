@@ -4,7 +4,7 @@ set -e
 # dockroute - Local development proxy for Docker
 # Eliminates port conflicts by routing via hostnames
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 PROXY_NAME="dockroute-traefik"
 NETWORK_NAME="dockroute"
 
@@ -125,7 +125,7 @@ cmd_tls() {
 	*)
 		echo "Usage: dockroute tls <setup|status|remove>"
 		echo ""
-		echo "  setup   Generate TLS certificates for PostgreSQL hostname routing"
+		echo "  setup   Generate TLS certificates for HTTPS and PostgreSQL routing"
 		echo "  status  Show TLS certificate status"
 		echo "  remove  Remove TLS certificates and config"
 		;;
@@ -166,6 +166,11 @@ tls:
       defaultCertificate:
         certFile: /etc/traefik/certs/cert.pem
         keyFile: /etc/traefik/certs/key.pem
+http:
+  middlewares:
+    redirect-https:
+      redirectScheme:
+        scheme: https
 EOF
 
 	echo ""
@@ -173,7 +178,7 @@ EOF
 	echo "  Certs:  ${CERTS_DIR}/"
 	echo "  Config: ${DYNAMIC_CONFIG}"
 	echo ""
-	echo "Restart the proxy to activate PostgreSQL routing:"
+	echo "Restart the proxy to activate HTTPS and PostgreSQL routing:"
 	echo "  dockroute stop && dockroute start"
 }
 
@@ -343,31 +348,51 @@ cmd_status() {
 		if tls_active; then
 			echo -e "TLS: ${GREEN}configured${NC}"
 		else
-			echo -e "TLS: not configured (run ${GREEN}dockroute tls setup${NC} for PostgreSQL routing)"
+			echo -e "TLS: not configured (run ${GREEN}dockroute tls setup${NC} for HTTPS and PostgreSQL routing)"
 		fi
 
 		echo ""
-		echo "HTTP routes:"
 
 		# Query Traefik API for HTTP routes (exclude internal Traefik routes)
 		ROUTES=$(curl -s http://dockroute.localhost/api/http/routers 2>/dev/null || echo "")
 
 		if [[ -n "$ROUTES" && "$ROUTES" != "[]" ]]; then
-			# Parse JSON to extract Host rules, excluding api@internal routes
-			# shellcheck disable=SC2016
-			HOSTS=$(echo "$ROUTES" |
+			# Split JSON into per-router fragments, excluding internal routes
+			local fragments
+			fragments=$(echo "$ROUTES" |
 				sed 's/},/}\n/g' |
-				grep -v '@internal' |
+				grep -v '@internal')
+
+			# Partition into HTTP and HTTPS routes based on "tls" presence
+			local http_hosts https_hosts
+			# shellcheck disable=SC2016
+			http_hosts=$(echo "$fragments" |
+				grep -v '"tls"' |
 				grep -o 'Host(`[^`]*`)' |
 				sed 's/Host(`\([^`]*\)`)/  http:\/\/\1/' |
 				sort -u)
 
-			if [[ -n "$HOSTS" ]]; then
-				echo "$HOSTS"
+			# shellcheck disable=SC2016
+			https_hosts=$(echo "$fragments" |
+				grep '"tls"' |
+				grep -o 'Host(`[^`]*`)' |
+				sed 's/Host(`\([^`]*\)`)/  https:\/\/\1/' |
+				sort -u)
+
+			if [[ -n "$https_hosts" ]]; then
+				echo "HTTPS routes:"
+				echo "$https_hosts"
+				echo ""
+			fi
+
+			echo "HTTP routes:"
+			if [[ -n "$http_hosts" ]]; then
+				echo "$http_hosts"
 			else
 				echo "  (none)"
 			fi
 		else
+			echo "HTTP routes:"
 			echo "  (none)"
 		fi
 
@@ -588,6 +613,7 @@ cmd_check() {
 			_kv_set "${current_svc}.ports" ""
 			_kv_set "${current_svc}.has_traefik" "false"
 			_kv_set "${current_svc}.has_tcp_traefik" "false"
+			_kv_set "${current_svc}.has_https" "false"
 			_kv_set "${current_svc}.traefik_labels" ""
 			_kv_set "${current_svc}.networks" ""
 			_kv_set "${current_svc}.has_build" "false"
@@ -637,6 +663,9 @@ cmd_check() {
 			fi
 			if [[ "$lbl_key" =~ ^traefik\.tcp\. ]]; then
 				_kv_set "${current_svc}.has_tcp_traefik" "true"
+			fi
+			if [[ "$lbl_key" =~ \.entrypoints$ && "$lbl_val" == "websecure" ]]; then
+				_kv_set "${current_svc}.has_https" "true"
 			fi
 			_kv_append "${current_svc}.traefik_labels" "${lbl_key}=${lbl_val}"$'\n'
 		fi
@@ -827,6 +856,16 @@ cmd_check() {
 			done <<<"$labels"
 		fi
 
+		# S1: TLS active but web/support service not using HTTPS
+		if tls_active; then
+			local has_https
+			has_https=$(_kv_get "${svc}.has_https")
+			if [[ ("$type" == "web" || "$type" == "support") && "$has_traefik" == true && "$has_https" == false ]]; then
+				issues+="ℹ TLS is active — HTTPS available (add entrypoints=websecure + tls=true)"$'\n'
+				suggestions=$((suggestions + 1))
+			fi
+		fi
+
 		# T1: TCP router uses HostSNI(*) — only supports one db at a time
 		local has_tcp
 		has_tcp=$(_kv_get "${svc}.has_tcp_traefik")
@@ -975,6 +1014,10 @@ cmd_check() {
 				echo "    labels:"
 				echo "      - \"traefik.enable=true\""
 				echo "      - \"traefik.http.routers.${router_name}.rule=Host(\`${hostname}\`)\""
+				if tls_active; then
+					echo "      - \"traefik.http.routers.${router_name}.entrypoints=websecure\""
+					echo "      - \"traefik.http.routers.${router_name}.tls=true\""
+				fi
 				if [[ -n "$container_port" ]]; then
 					echo "      - \"traefik.http.services.${router_name}.loadbalancer.server.port=${container_port}\""
 				else
@@ -1069,7 +1112,7 @@ cmd_help() {
 	echo "  check       Check a compose file for dockroute issues"
 	echo "  logs        Follow proxy logs"
 	echo "  ensure      Start proxy if not running (for scripts)"
-	echo "  tls setup   Generate TLS certs for PostgreSQL routing"
+	echo "  tls setup   Generate TLS certs for HTTPS and PostgreSQL routing"
 	echo "  tls status  Show TLS certificate status"
 	echo "  tls remove  Remove TLS certs and config"
 	echo "  version     Show version"
@@ -1091,6 +1134,22 @@ cmd_help() {
 	echo "    networks:"
 	echo "      dockroute:"
 	echo "        external: true"
+	echo ""
+	echo "HTTPS Setup (after 'dockroute tls setup'):"
+	echo ""
+	echo "    services:"
+	echo "      app:"
+	echo "        labels:"
+	echo "          - \"traefik.enable=true\""
+	echo "          - \"traefik.http.routers.myapp.rule=Host(\\\`myapp.localhost\\\`)\""
+	echo "          - \"traefik.http.routers.myapp.entrypoints=websecure\""
+	echo "          - \"traefik.http.routers.myapp.tls=true\""
+	echo "          - \"traefik.http.services.myapp.loadbalancer.server.port=3000\""
+	echo "        networks:"
+	echo "          - dockroute"
+	echo "          - default"
+	echo ""
+	echo "  Access at: https://myapp.localhost"
 	echo ""
 	echo "PostgreSQL Routing (after 'dockroute tls setup'):"
 	echo ""

@@ -201,15 +201,15 @@ mise run down   # Stop
 
 ## Port Strategy
 
-Everything routes through port 80 using hostnames — no port conflicts, no ports to remember:
+Everything routes through port 80 (or 443 with TLS) using hostnames — no port conflicts, no ports to remember:
 
-| Service | Before | After |
-|---------|--------|-------|
-| Web app | `localhost:3000` | `myapp.localhost` |
-| WebSockets | `localhost:6001` | `myapp-ws.localhost` |
-| Mailhog | `localhost:8025` | `myapp-mail.localhost` |
-| PostgreSQL | `localhost:5432` | `myapp-db.localhost:5432` (TLS) |
-| Redis | `localhost:6379` | Not exposed (internal) |
+| Service | Before | After | HTTPS |
+|---------|--------|-------|-------|
+| Web app | `localhost:3000` | `http://myapp.localhost` | `https://myapp.localhost` |
+| WebSockets | `localhost:6001` | `http://myapp-ws.localhost` | `https://myapp-ws.localhost` |
+| Mailhog | `localhost:8025` | `http://myapp-mail.localhost` | `https://myapp-mail.localhost` |
+| PostgreSQL | `localhost:5432` | `myapp-db.localhost:5432` (TLS) | — |
+| Redis | `localhost:6379` | Not exposed (internal) | — |
 
 Databases and caches don't need exposed ports — your app connects via Docker's internal network using the service name (e.g., `postgres://user:pass@db:5432/mydb`).
 
@@ -236,6 +236,53 @@ REDIS_PORT=6380
 ```
 
 The dashboard is available at `dockroute.localhost`.
+
+## HTTPS Routing
+
+After running `dockroute tls setup`, web services can use HTTPS via the `websecure` entrypoint. This is opt-in — HTTP-only services continue to work as before.
+
+### Project Configuration
+
+Add `entrypoints=websecure` and `tls=true` to your service labels:
+
+```yaml
+services:
+  app:
+    build: .
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.myapp.rule=Host(`myapp.localhost`)"
+      - "traefik.http.routers.myapp.entrypoints=websecure"
+      - "traefik.http.routers.myapp.tls=true"
+      - "traefik.http.services.myapp.loadbalancer.server.port=3000"
+    networks:
+      - dockroute
+      - default
+
+networks:
+  dockroute:
+    external: true
+```
+
+Access at: https://myapp.localhost
+
+### HTTP → HTTPS Redirect (Optional)
+
+To redirect HTTP requests to HTTPS for a specific service, add the `redirect-https@file` middleware (provided by `dockroute tls setup`):
+
+```yaml
+labels:
+  - "traefik.enable=true"
+  - "traefik.http.routers.myapp.rule=Host(`myapp.localhost`)"
+  - "traefik.http.routers.myapp.entrypoints=websecure"
+  - "traefik.http.routers.myapp.tls=true"
+  - "traefik.http.routers.myapp-http.rule=Host(`myapp.localhost`)"
+  - "traefik.http.routers.myapp-http.entrypoints=web"
+  - "traefik.http.routers.myapp-http.middlewares=redirect-https@file"
+  - "traefik.http.services.myapp.loadbalancer.server.port=3000"
+```
+
+This creates two routers: `myapp` handles HTTPS, and `myapp-http` catches HTTP requests and redirects them. No global redirect is applied — other services remain HTTP-only.
 
 ## PostgreSQL Routing
 
@@ -299,6 +346,58 @@ DATABASE_URL=postgres://user:pass@db:5432/mydb
 - **Port 5432 conflict** — if a local PostgreSQL server is running, stop it first or change its port
 - **Cert expiry** — mkcert certs last ~27 months; check with `dockroute tls status`
 
+## Gotchas
+
+### Framework dev servers still print `localhost:PORT`
+
+After switching to dockroute, your framework's dev server will still log its internal listen address:
+
+```
+▲ Next.js 16.1.1
+- Local: http://localhost:3000
+```
+
+This is the address **inside the container**, not how you access the app. Use the dockroute hostname (`myapp.localhost`) instead. There's nothing to fix — every framework does this.
+
+### Content Security Policy needs updating
+
+If your app sets a Content Security Policy, hardcoded `localhost:PORT` values will break. CSP directives like `connect-src` and `script-src` must match the dockroute hostnames:
+
+```diff
+- connect-src 'self' ws://localhost:6001
++ connect-src 'self' ws://myapp-ws.localhost:80
+```
+
+For Next.js, read the host/port from environment variables instead of hardcoding:
+
+```typescript
+// next.config.ts — build CSP from env vars
+const soketiHost = process.env.NEXT_PUBLIC_SOKETI_HOST; // myapp-ws.localhost
+const soketiPort = process.env.NEXT_PUBLIC_SOKETI_PORT; // 80
+const connectSrc = soketiHost ? `ws://${soketiHost}:${soketiPort}` : '';
+```
+
+### `.env` files need updating
+
+`docker-compose.yml` defaults (via `${VAR:-default}`) only apply when the variable is **unset**. If your `.env` file still has `localhost:3000` values, they override the dockroute defaults. Update your `.env` to match:
+
+```env
+NEXT_PUBLIC_APP_URL=http://myapp.localhost
+NEXT_PUBLIC_SOKETI_HOST=myapp-ws.localhost
+NEXT_PUBLIC_SOKETI_PORT=80
+```
+
+### Lazy-init proxies and the `in` operator
+
+Some frameworks use lazy-initialized module proxies to defer heavy setup (database connections, etc.) until first use. If a library checks `"property" in proxy` to branch its behavior, the `in` operator uses the proxy's `has` trap — not `get`. A proxy with only a `get` trap will check the raw target object instead, potentially taking the wrong code path. Add a `has` trap if your proxy wraps a lazily-created object:
+
+```typescript
+export const instance = new Proxy({} as MyType, {
+  get(_, prop) { return Reflect.get(getRealInstance(), prop); },
+  has(_, prop) { return Reflect.has(getRealInstance(), prop); }, // ← don't forget this
+});
+```
+
 ## How It Works
 
 1. **Shared network**: All projects connect to a `dockroute` network
@@ -317,7 +416,7 @@ DATABASE_URL=postgres://user:pass@db:5432/mydb
 | `dockroute check [path]` | Check a compose file for dockroute issues |
 | `dockroute logs` | Follow proxy logs |
 | `dockroute ensure` | Start if not running (for scripts) |
-| `dockroute tls setup` | Generate TLS certs for PostgreSQL routing |
+| `dockroute tls setup` | Generate TLS certs for HTTPS and PostgreSQL routing |
 | `dockroute tls status` | Show TLS certificate status |
 | `dockroute tls remove` | Remove TLS certs and config |
 | `dockroute version` | Show version |

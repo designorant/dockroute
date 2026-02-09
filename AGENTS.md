@@ -44,6 +44,26 @@ networks:
 - Use the project directory name (lowercased, hyphens allowed) as the prefix
 - Remove the `ports:` mapping from the service
 
+### HTTPS web services — opt-in after `dockroute tls setup`
+
+To serve a web service over HTTPS, add `entrypoints=websecure` and `tls=true` to its HTTP router labels:
+
+```yaml
+labels:
+  - "traefik.enable=true"
+  - "traefik.http.routers.<prefix>.rule=Host(`<prefix>.localhost`)"
+  - "traefik.http.routers.<prefix>.entrypoints=websecure"
+  - "traefik.http.routers.<prefix>.tls=true"
+  - "traefik.http.services.<prefix>.loadbalancer.server.port=<container-port>"
+networks:
+  - dockroute
+  - default
+```
+
+- Requires `dockroute tls setup` (one-time) — generates `*.localhost` TLS certs
+- HTTP-only services continue to work unchanged — HTTPS is opt-in per service
+- For HTTP → HTTPS redirect, add a second router with `middlewares=redirect-https@file`
+
 ### PostgreSQL services — TCP labels for hostname routing
 
 PostgreSQL services should use TCP labels for hostname routing instead of exposed ports. This requires a one-time `dockroute tls setup`.
