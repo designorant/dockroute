@@ -44,11 +44,34 @@ networks:
 - Use the project directory name (lowercased, hyphens allowed) as the prefix
 - Remove the `ports:` mapping from the service
 
-### Internal services — remove `ports:`
+### PostgreSQL services — TCP labels for hostname routing
 
-Databases, caches, and message brokers (postgres, mysql, redis, memcached, rabbitmq, elasticsearch) should have no `ports:` mapping. Apps connect via Docker's internal network using the service name (e.g., `redis://redis:6379`).
+PostgreSQL services should use TCP labels for hostname routing instead of exposed ports. This requires a one-time `dockroute tls setup`.
 
-If a port is exposed for host-side GUI tools (TablePlus, Drizzle Studio), use an environment variable: `"${POSTGRES_PORT:-5432}:5432"` with the port set in `.env`.
+```yaml
+db:
+  image: postgres:16
+  labels:
+    - "traefik.enable=true"
+    - "traefik.tcp.routers.<prefix>-db.rule=HostSNI(`<prefix>-db.localhost`)"
+    - "traefik.tcp.routers.<prefix>-db.entrypoints=postgres"
+    - "traefik.tcp.routers.<prefix>-db.tls=true"
+    - "traefik.tcp.services.<prefix>-db.loadbalancer.server.port=5432"
+  networks:
+    - dockroute
+    - default
+```
+
+- Host connections require `sslmode=require`: `postgres://user:pass@<prefix>-db.localhost:5432/mydb?sslmode=require`
+- Internal app connections are unchanged: `postgres://user:pass@db:5432/mydb` (no TLS needed)
+- TCP router names must be project-scoped (e.g., `myapp-db`, not `db` or `postgres`)
+- Do NOT use `HostSNI(*)` — it prevents multi-project routing
+
+### Other internal services — remove `ports:`
+
+Caches and message brokers (mysql, redis, memcached, rabbitmq, elasticsearch) should have no `ports:` mapping. Apps connect via Docker's internal network using the service name (e.g., `redis://redis:6379`).
+
+If a port is exposed for host-side GUI tools (TablePlus, RedisInsight), use an environment variable: `"${REDIS_PORT:-6379}:6379"` with the port set in `.env`.
 
 ### Supporting services — flat subdomain pattern
 

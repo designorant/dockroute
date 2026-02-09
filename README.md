@@ -208,66 +208,96 @@ Everything routes through port 80 using hostnames — no port conflicts, no port
 | Web app | `localhost:3000` | `myapp.localhost` |
 | WebSockets | `localhost:6001` | `myapp-ws.localhost` |
 | Mailhog | `localhost:8025` | `myapp-mail.localhost` |
-| Database | `localhost:5432` | Not exposed (internal) |
+| PostgreSQL | `localhost:5432` | `myapp-db.localhost:5432` (TLS) |
 | Redis | `localhost:6379` | Not exposed (internal) |
 
 Databases and caches don't need exposed ports — your app connects via Docker's internal network using the service name (e.g., `postgres://user:pass@db:5432/mydb`).
 
-If you need host access for tools like Drizzle Kit, TablePlus, or RedisInsight, the simplest option is `docker compose exec`:
+For tools like Redis CLI or `mysql`, the simplest option is `docker compose exec`:
 
 ```bash
-docker compose exec db psql -U postgres
 docker compose exec redis redis-cli
 ```
 
-For GUI tools that require a host port, use an environment variable so each project can set its own port in `.env`:
+For GUI tools (Redis, MySQL) that require a host port, use an environment variable so each project can set its own port in `.env`:
 
 ```yaml
 # docker-compose.yml
 services:
-  db:
-    image: postgres:16
+  redis:
+    image: redis
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${REDIS_PORT:-6379}:6379"
 ```
 
 ```bash
 # .env (gitignored, set once per project)
-POSTGRES_PORT=5433
+REDIS_PORT=6380
 ```
 
 The dashboard is available at `dockroute.localhost`.
 
-## Extending with Custom Entrypoints
+## PostgreSQL Routing
 
-For TCP services (databases, Redis) that you want to expose, create a local override:
+For PostgreSQL, dockroute supports hostname-based routing — multiple projects share port 5432, each accessible via its own hostname:
 
-```yaml
-# docker-compose.override.yml (in dockroute directory)
-services:
-  traefik:
-    command:
-      # Include all existing commands, plus:
-      - "--entrypoints.postgres.address=:5432"
-      - "--entrypoints.redis.address=:6379"
-    ports:
-      - "5432:5432"
-      - "6379:6379"
+```
+psql "host=myapp-db.localhost sslmode=require"       → Project A's Postgres
+psql "host=storefront-db.localhost sslmode=require"   → Project B's Postgres
 ```
 
-Then configure TCP routing in your project:
+This works via PostgreSQL's STARTTLS protocol: clients initiate TLS with an SNI hostname, and Traefik routes to the correct backend. Requires `sslmode=require` in all connections.
+
+### Setup
+
+One-time setup (requires [mkcert](https://github.com/FiloSottile/mkcert)):
+
+```bash
+dockroute tls setup     # Generates *.localhost TLS certs
+dockroute stop && dockroute start
+```
+
+### Project Configuration
+
+Add TCP labels to your PostgreSQL service:
 
 ```yaml
 services:
   db:
+    image: postgres:16
     labels:
       - "traefik.enable=true"
-      - "traefik.tcp.routers.myapp-db.rule=HostSNI(`*`)"
+      - "traefik.tcp.routers.myapp-db.rule=HostSNI(`myapp-db.localhost`)"
       - "traefik.tcp.routers.myapp-db.entrypoints=postgres"
+      - "traefik.tcp.routers.myapp-db.tls=true"
       - "traefik.tcp.services.myapp-db.loadbalancer.server.port=5432"
+    networks:
+      - dockroute
+      - default
 ```
 
-**Note:** TCP routing by hostname requires TLS (SNI). For local dev, it's usually simpler to keep databases internal.
+No `ports:` mapping needed — Traefik handles it.
+
+### Connecting
+
+```bash
+# psql
+psql "host=myapp-db.localhost port=5432 sslmode=require user=postgres"
+
+# Drizzle Kit / ORMs
+DATABASE_URL=postgres://user:pass@myapp-db.localhost:5432/mydb?sslmode=require
+
+# Internal app connections (unchanged, no TLS needed)
+DATABASE_URL=postgres://user:pass@db:5432/mydb
+```
+
+**Important:** `sslmode=require` is mandatory for host connections. Without it, clients skip TLS and the connection fails.
+
+### Limitations
+
+- **PostgreSQL only** — MySQL's server-first protocol prevents SNI extraction; Redis has no STARTTLS support in Traefik
+- **Port 5432 conflict** — if a local PostgreSQL server is running, stop it first or change its port
+- **Cert expiry** — mkcert certs last ~27 months; check with `dockroute tls status`
 
 ## How It Works
 
@@ -287,6 +317,9 @@ services:
 | `dockroute check [path]` | Check a compose file for dockroute issues |
 | `dockroute logs` | Follow proxy logs |
 | `dockroute ensure` | Start if not running (for scripts) |
+| `dockroute tls setup` | Generate TLS certs for PostgreSQL routing |
+| `dockroute tls status` | Show TLS certificate status |
+| `dockroute tls remove` | Remove TLS certs and config |
 | `dockroute version` | Show version |
 | `dockroute help` | Show help |
 
@@ -302,7 +335,8 @@ This project uses [dockroute](https://github.com/designorant/dockroute) for loca
 ### Rules for `docker-compose.yml`
 
 - **Web services**: Replace `ports:` with Traefik labels (`traefik.enable=true`, router rule, loadbalancer port). Add both `dockroute` and `default` networks. Use the project directory name as the `<prefix>`.
-- **Internal services** (databases, caches): Remove `ports:` — apps connect via Docker's internal network (e.g., `redis://redis:6379`). For host GUI access, use env var pattern: `"${POSTGRES_PORT:-5432}:5432"`.
+- **PostgreSQL**: Use TCP labels for hostname routing (`traefik.tcp.routers.<prefix>-db.rule=HostSNI(...)`, `entrypoints=postgres`, `tls=true`). Requires `dockroute tls setup`. Connect with `sslmode=require` from host.
+- **Internal services** (Redis, MySQL, caches): Remove `ports:` — apps connect via Docker's internal network (e.g., `redis://redis:6379`). For host GUI access, use env var pattern: `"${REDIS_PORT:-6379}:6379"`.
 - **Supporting services** (Mailhog, MinIO, etc.): Route through Traefik with flat subdomain: `<prefix>-<service>.localhost` (NOT `<service>.<prefix>.localhost`).
 - **WebSocket services**: Use `<prefix>-ws.localhost` as hostname.
 - **Naming**: Router names and hostnames must be project-scoped (`myapp`, not `app`).

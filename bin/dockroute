@@ -4,7 +4,7 @@ set -e
 # dockroute - Local development proxy for Docker
 # Eliminates port conflicts by routing via hostnames
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 PROXY_NAME="dockroute-traefik"
 NETWORK_NAME="dockroute"
 
@@ -29,6 +29,219 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m' # No Color
+
+DOCKROUTE_DIR="${HOME}/.dockroute"
+CERTS_DIR="${DOCKROUTE_DIR}/certs"
+DYNAMIC_CONFIG="${DOCKROUTE_DIR}/traefik-dynamic.yml"
+GENERATED_COMPOSE="${DOCKROUTE_DIR}/docker-compose.yml"
+
+tls_active() {
+	[[ -f "${CERTS_DIR}/cert.pem" && -f "${CERTS_DIR}/key.pem" ]]
+}
+
+generate_compose() {
+	mkdir -p "$DOCKROUTE_DIR"
+
+	if tls_active; then
+		cat >"$GENERATED_COMPOSE" <<EOF
+services:
+  traefik:
+    image: traefik:v3
+    container_name: dockroute-traefik
+    restart: unless-stopped
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.postgres.address=:5432"
+      - "--providers.file.filename=/etc/traefik/dynamic.yml"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dockroute.rule=Host(\`dockroute.localhost\`)"
+      - "traefik.http.services.dockroute.loadbalancer.server.port=8080"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "5432:5432"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${CERTS_DIR}:/etc/traefik/certs:ro
+      - ${DYNAMIC_CONFIG}:/etc/traefik/dynamic.yml:ro
+    networks:
+      - dockroute
+
+networks:
+  dockroute:
+    external: true
+EOF
+	else
+		cat >"$GENERATED_COMPOSE" <<EOF
+services:
+  traefik:
+    image: traefik:v3
+    container_name: dockroute-traefik
+    restart: unless-stopped
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dockroute.rule=Host(\`dockroute.localhost\`)"
+      - "traefik.http.services.dockroute.loadbalancer.server.port=8080"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - dockroute
+
+networks:
+  dockroute:
+    external: true
+EOF
+	fi
+}
+
+active_compose() {
+	if [[ -f "$GENERATED_COMPOSE" ]]; then
+		echo "$GENERATED_COMPOSE"
+	else
+		echo "$COMPOSE_FILE"
+	fi
+}
+
+cmd_tls() {
+	local subcmd="${2:-}"
+	case "$subcmd" in
+	setup) cmd_tls_setup ;;
+	status) cmd_tls_status ;;
+	remove) cmd_tls_remove ;;
+	*)
+		echo "Usage: dockroute tls <setup|status|remove>"
+		echo ""
+		echo "  setup   Generate TLS certificates for PostgreSQL hostname routing"
+		echo "  status  Show TLS certificate status"
+		echo "  remove  Remove TLS certificates and config"
+		;;
+	esac
+}
+
+cmd_tls_setup() {
+	# Check for mkcert
+	if ! command -v mkcert >/dev/null 2>&1; then
+		echo -e "${RED}Error: mkcert is not installed${NC}"
+		echo ""
+		echo "Install it with:"
+		echo "  brew install mkcert    # macOS"
+		echo "  apt install mkcert     # Debian/Ubuntu"
+		echo ""
+		echo "Then run: dockroute tls setup"
+		exit 1
+	fi
+
+	# Install local CA if needed
+	echo "Installing local CA (may prompt for password)..."
+	mkcert -install
+
+	# Generate certs
+	mkdir -p "$CERTS_DIR"
+	echo "Generating *.localhost certificate..."
+	mkcert -cert-file "${CERTS_DIR}/cert.pem" -key-file "${CERTS_DIR}/key.pem" \
+		"*.localhost" "localhost" 2>&1
+
+	# Write Traefik dynamic config
+	cat >"$DYNAMIC_CONFIG" <<'EOF'
+tls:
+  certificates:
+    - certFile: /etc/traefik/certs/cert.pem
+      keyFile: /etc/traefik/certs/key.pem
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /etc/traefik/certs/cert.pem
+        keyFile: /etc/traefik/certs/key.pem
+EOF
+
+	echo ""
+	echo -e "${GREEN}✓ TLS configured${NC}"
+	echo "  Certs:  ${CERTS_DIR}/"
+	echo "  Config: ${DYNAMIC_CONFIG}"
+	echo ""
+	echo "Restart the proxy to activate PostgreSQL routing:"
+	echo "  dockroute stop && dockroute start"
+}
+
+cmd_tls_status() {
+	if tls_active; then
+		echo -e "${GREEN}✓ TLS certificates installed${NC}"
+		echo "  Cert: ${CERTS_DIR}/cert.pem"
+		echo "  Key:  ${CERTS_DIR}/key.pem"
+
+		# Show cert expiry
+		if command -v openssl >/dev/null 2>&1; then
+			local expiry
+			expiry=$(openssl x509 -enddate -noout -in "${CERTS_DIR}/cert.pem" 2>/dev/null | cut -d= -f2)
+			if [[ -n "$expiry" ]]; then
+				echo "  Expires: $expiry"
+			fi
+		fi
+
+		echo ""
+		if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${PROXY_NAME}$"; then
+			# Check if postgres entrypoint is active
+			local entrypoints
+			entrypoints=$(curl -s http://dockroute.localhost/api/entrypoints 2>/dev/null || echo "")
+			if echo "$entrypoints" | grep -q '"postgres"'; then
+				echo -e "${GREEN}✓ PostgreSQL entrypoint active on port 5432${NC}"
+			else
+				echo -e "${YELLOW}! PostgreSQL entrypoint not active — restart proxy${NC}"
+				echo "  dockroute stop && dockroute start"
+			fi
+		else
+			echo "Proxy is not running. Start it with: dockroute start"
+		fi
+	else
+		echo -e "${YELLOW}TLS certificates not installed${NC}"
+		echo ""
+		echo "Run: dockroute tls setup"
+	fi
+}
+
+cmd_tls_remove() {
+	local removed=false
+
+	if [[ -d "$CERTS_DIR" ]]; then
+		rm -rf "$CERTS_DIR"
+		echo -e "${GREEN}✓ Removed certificates${NC}"
+		removed=true
+	fi
+
+	if [[ -f "$DYNAMIC_CONFIG" ]]; then
+		rm -f "$DYNAMIC_CONFIG"
+		echo -e "${GREEN}✓ Removed dynamic config${NC}"
+		removed=true
+	fi
+
+	if [[ -f "$GENERATED_COMPOSE" ]]; then
+		rm -f "$GENERATED_COMPOSE"
+		echo -e "${GREEN}✓ Removed generated compose file${NC}"
+		removed=true
+	fi
+
+	if [[ "$removed" == true ]]; then
+		echo ""
+		echo "Restart the proxy to deactivate PostgreSQL routing:"
+		echo "  dockroute stop && dockroute start"
+	else
+		echo "Nothing to remove — TLS is not configured"
+	fi
+}
 
 migrate_network() {
 	# Skip if old network doesn't exist
@@ -71,14 +284,34 @@ cmd_start() {
 		docker network create "$NETWORK_NAME"
 	fi
 
+	# Generate compose file with current TLS state
+	generate_compose
+	local compose
+	compose=$(active_compose)
+
 	# Start Traefik if not running
 	if ! docker ps --format '{{.Names}}' | grep -q "^${PROXY_NAME}$"; then
+		# Check for port 5432 conflict when TLS is active
+		if tls_active; then
+			if lsof -i :5432 -sTCP:LISTEN >/dev/null 2>&1; then
+				echo -e "${YELLOW}Warning: Port 5432 is already in use — PostgreSQL routing will not work${NC}"
+				echo "  Stop the local PostgreSQL server and restart dockroute"
+				echo ""
+			fi
+		fi
+
 		echo -e "${GREEN}Starting dockroute...${NC}"
-		docker compose -f "$COMPOSE_FILE" -p dockroute up -d
+		docker compose -f "$compose" -p dockroute up -d
 		echo ""
 		echo -e "${GREEN}✓ Proxy running${NC}"
 		echo "  Dashboard: http://dockroute.localhost"
 		echo "  Projects:  http://<project>.localhost"
+		if tls_active; then
+			echo "  PostgreSQL: <project>-db.localhost:5432 (sslmode=require)"
+		else
+			echo ""
+			echo -e "  Tip: Run ${GREEN}dockroute tls setup${NC} to enable PostgreSQL hostname routing"
+		fi
 	else
 		echo -e "${GREEN}✓ Proxy already running${NC}"
 	fi
@@ -86,8 +319,10 @@ cmd_start() {
 
 cmd_stop() {
 	if docker ps --format '{{.Names}}' | grep -q "^${PROXY_NAME}$"; then
+		local compose
+		compose=$(active_compose)
 		echo "Stopping dockroute..."
-		docker compose -f "$COMPOSE_FILE" -p dockroute down
+		docker compose -f "$compose" -p dockroute down
 		echo -e "${GREEN}✓ Stopped${NC}"
 	else
 		echo -e "${YELLOW}Proxy is not running${NC}"
@@ -103,10 +338,18 @@ cmd_status() {
 		echo -e "${GREEN}✓ Proxy is running${NC}"
 		echo ""
 		echo "Dashboard: http://dockroute.localhost"
-		echo ""
-		echo "Routed services:"
 
-		# Query Traefik API for routes (exclude internal Traefik routes)
+		# TLS status
+		if tls_active; then
+			echo -e "TLS: ${GREEN}configured${NC}"
+		else
+			echo -e "TLS: not configured (run ${GREEN}dockroute tls setup${NC} for PostgreSQL routing)"
+		fi
+
+		echo ""
+		echo "HTTP routes:"
+
+		# Query Traefik API for HTTP routes (exclude internal Traefik routes)
 		ROUTES=$(curl -s http://dockroute.localhost/api/http/routers 2>/dev/null || echo "")
 
 		if [[ -n "$ROUTES" && "$ROUTES" != "[]" ]]; then
@@ -122,10 +365,30 @@ cmd_status() {
 			if [[ -n "$HOSTS" ]]; then
 				echo "$HOSTS"
 			else
-				echo "  (no services registered)"
+				echo "  (none)"
 			fi
 		else
-			echo "  (no services registered)"
+			echo "  (none)"
+		fi
+
+		# Query Traefik API for TCP routes
+		TCP_ROUTES=$(curl -s http://dockroute.localhost/api/tcp/routers 2>/dev/null || echo "")
+
+		if [[ -n "$TCP_ROUTES" && "$TCP_ROUTES" != "[]" ]]; then
+			# shellcheck disable=SC2016
+			TCP_HOSTS=$(echo "$TCP_ROUTES" |
+				sed 's/},/}\n/g' |
+				grep -v '@internal' |
+				grep -o 'HostSNI(`[^`]*`)' |
+				grep -v 'HostSNI(`\*`)' |
+				sed 's/HostSNI(`\([^`]*\)`)/  \1:5432 (sslmode=require)/' |
+				sort -u)
+
+			if [[ -n "$TCP_HOSTS" ]]; then
+				echo ""
+				echo "TCP routes (PostgreSQL):"
+				echo "$TCP_HOSTS"
+			fi
 		fi
 	else
 		echo -e "${RED}✗ Proxy is not running${NC}"
@@ -136,7 +399,9 @@ cmd_status() {
 
 cmd_logs() {
 	if docker ps --format '{{.Names}}' | grep -q "^${PROXY_NAME}$"; then
-		docker compose -f "$COMPOSE_FILE" -p dockroute logs -f
+		local compose
+		compose=$(active_compose)
+		docker compose -f "$compose" -p dockroute logs -f
 	else
 		echo -e "${RED}Proxy is not running${NC}"
 		echo "Run: dockroute start"
@@ -152,9 +417,13 @@ cmd_ensure() {
 		docker network create "$NETWORK_NAME" >/dev/null
 	fi
 
+	generate_compose
+	local compose
+	compose=$(active_compose)
+
 	if ! docker ps --format '{{.Names}}' | grep -q "^${PROXY_NAME}$"; then
 		echo "Starting dockroute..."
-		docker compose -f "$COMPOSE_FILE" -p dockroute up -d >/dev/null
+		docker compose -f "$compose" -p dockroute up -d >/dev/null
 		echo -e "${GREEN}✓ Proxy started${NC}"
 	fi
 }
@@ -318,6 +587,7 @@ cmd_check() {
 			_kv_set "${current_svc}.image" ""
 			_kv_set "${current_svc}.ports" ""
 			_kv_set "${current_svc}.has_traefik" "false"
+			_kv_set "${current_svc}.has_tcp_traefik" "false"
 			_kv_set "${current_svc}.traefik_labels" ""
 			_kv_set "${current_svc}.networks" ""
 			_kv_set "${current_svc}.has_build" "false"
@@ -364,6 +634,9 @@ cmd_check() {
 			lbl_val="${lbl_val#\"}"
 			if [[ "$lbl_key" == "traefik.enable" && "$lbl_val" == "true" ]]; then
 				_kv_set "${current_svc}.has_traefik" "true"
+			fi
+			if [[ "$lbl_key" =~ ^traefik\.tcp\. ]]; then
+				_kv_set "${current_svc}.has_tcp_traefik" "true"
 			fi
 			_kv_append "${current_svc}.traefik_labels" "${lbl_key}=${lbl_val}"$'\n'
 		fi
@@ -478,13 +751,30 @@ cmd_check() {
 
 		# D1: Database/cache exposes ports
 		if [[ "$type" == "database" && "$has_ports" == true ]]; then
+			local has_tcp
+			has_tcp=$(_kv_get "${svc}.has_tcp_traefik")
+			local svc_img
+			svc_img=$(_kv_get "${svc}.image")
+			local is_postgres=false
+			[[ "$svc_img" =~ postgres ]] && is_postgres=true
+
 			# Check raw compose file for env var pattern (docker compose config resolves variables)
 			local uses_env_var=false
 			# shellcheck disable=SC2016
 			if echo "$raw_content" | grep -A5 "^  ${svc}:" | grep -q '${'; then
 				uses_env_var=true
 			fi
-			if [[ "$uses_env_var" == true ]]; then
+			if [[ "$has_tcp" == true ]]; then
+				issues+="${YELLOW}!${NC} Has TCP labels but still exposes ports — remove ports"$'\n'
+				warnings=$((warnings + 1))
+				need_suggestion=true
+			elif [[ "$is_postgres" == true ]]; then
+				local port_list
+				port_list=$(echo -n "$svc_ports_val" | tr '\n' ', ' | sed 's/,$//')
+				issues+="${YELLOW}!${NC} Exposes port [$port_list] — use TCP labels for hostname routing (dockroute tls setup)"$'\n'
+				suggestions=$((suggestions + 1))
+				need_suggestion=true
+			elif [[ "$uses_env_var" == true ]]; then
 				issues+="${GREEN}✓${NC} Uses env var pattern for port access"$'\n'
 			else
 				local port_list
@@ -535,6 +825,52 @@ cmd_check() {
 					warnings=$((warnings + 1))
 				fi
 			done <<<"$labels"
+		fi
+
+		# T1: TCP router uses HostSNI(*) — only supports one db at a time
+		local has_tcp
+		has_tcp=$(_kv_get "${svc}.has_tcp_traefik")
+		if [[ "$has_tcp" == true ]]; then
+			local labels
+			labels=$(_kv_get "${svc}.traefik_labels")
+			# shellcheck disable=SC2016
+			local hostsni_wildcard_re='HostSNI\(`\*`\)'
+			while IFS= read -r lbl; do
+				if [[ "$lbl" =~ $hostsni_wildcard_re ]]; then
+					issues+="${YELLOW}!${NC} TCP router uses HostSNI(\`*\`) — use HostSNI(\`${prefix}-${svc}.localhost\`) for multi-project routing"$'\n'
+					warnings=$((warnings + 1))
+					need_suggestion=true
+					break
+				fi
+			done <<<"$labels"
+		fi
+
+		# T2: TCP router name is generic — collision risk
+		if [[ "$has_tcp" == true ]]; then
+			local labels
+			labels=$(_kv_get "${svc}.traefik_labels")
+			local tcp_router_name=""
+			while IFS= read -r lbl; do
+				if [[ "$lbl" =~ traefik\.tcp\.routers\.([^.]+)\. ]]; then
+					tcp_router_name="${BASH_REMATCH[1]}"
+					break
+				fi
+			done <<<"$labels"
+			if [[ -n "$tcp_router_name" ]]; then
+				case "$tcp_router_name" in
+				db | postgres | postgresql | database | pg)
+					issues+="${YELLOW}!${NC} TCP router name '$tcp_router_name' is generic — use '${prefix}-${svc}' to avoid collisions"$'\n'
+					warnings=$((warnings + 1))
+					;;
+				esac
+			fi
+		fi
+
+		# T3: TCP service has labels but missing dockroute network
+		if [[ "$has_tcp" == true && "$on_dockroute" == false ]]; then
+			issues+="${RED}✗${NC} Has TCP labels but missing dockroute network"$'\n'
+			errors=$((errors + 1))
+			need_suggestion=true
 		fi
 
 		_kv_set "${svc}.issues" "$issues"
@@ -649,25 +985,51 @@ cmd_check() {
 				echo "      - default"
 			fi
 
-			# Suggest network if has Traefik but missing dockroute
-			if [[ "$has_traefik" == true && "$on_dockroute" == false ]]; then
+			# Suggest TCP labels for PostgreSQL services
+			local svc_img
+			svc_img=$(_kv_get "${svc}.image")
+			local has_tcp
+			has_tcp=$(_kv_get "${svc}.has_tcp_traefik")
+			if [[ "$type" == "database" && "$svc_img" =~ postgres && "$has_tcp" == false ]]; then
+				local tcp_name="${prefix}-${svc}"
+				echo "    labels:"
+				echo "      - \"traefik.enable=true\""
+				echo "      - \"traefik.tcp.routers.${tcp_name}.rule=HostSNI(\`${tcp_name}.localhost\`)\""
+				echo "      - \"traefik.tcp.routers.${tcp_name}.entrypoints=postgres\""
+				echo "      - \"traefik.tcp.routers.${tcp_name}.tls=true\""
+				echo "      - \"traefik.tcp.services.${tcp_name}.loadbalancer.server.port=5432\""
 				echo "    networks:"
 				echo "      - dockroute"
 				echo "      - default"
+				echo "    # Remove: ports"
+				echo "    # Host access: psql \"host=${tcp_name}.localhost sslmode=require\""
+			fi
+
+			# Suggest network if has Traefik/TCP but missing dockroute
+			if [[ ("$has_traefik" == true || "$has_tcp" == true) && "$on_dockroute" == false ]]; then
+				# Only suggest if not already suggested above (postgres TCP suggestion includes networks)
+				if ! [[ "$type" == "database" && "$svc_img" =~ postgres && "$has_tcp" == false ]]; then
+					echo "    networks:"
+					echo "      - dockroute"
+					echo "      - default"
+				fi
 			fi
 
 			# Suggest removing ports
 			if [[ "$has_ports" == true ]]; then
 				if [[ "$type" == "database" ]]; then
-					local svc_name
-					svc_name=$(_kv_get "${svc}.image")
-					svc_name="${svc_name%%:*}"
-					svc_name="${svc_name##*/}"
-					local first_port
-					first_port=$(echo "$svc_ports_val" | head -1)
-					local container_port="${first_port##*:}"
-					echo "    # Remove: ports"
-					echo "    # Connect internally: ${svc_name}://${svc}:${container_port}"
+					# Skip port removal suggestion for postgres — already handled by TCP suggestion above
+					if ! [[ "$svc_img" =~ postgres ]]; then
+						local svc_name
+						svc_name=$(_kv_get "${svc}.image")
+						svc_name="${svc_name%%:*}"
+						svc_name="${svc_name##*/}"
+						local first_port
+						first_port=$(echo "$svc_ports_val" | head -1)
+						local container_port="${first_port##*:}"
+						echo "    # Remove: ports"
+						echo "    # Connect internally: ${svc_name}://${svc}:${container_port}"
+					fi
 				elif [[ "$has_traefik" == true || "$type" == "web" || "$type" == "support" ]]; then
 					echo "    # Remove: ports"
 				fi
@@ -701,16 +1063,19 @@ cmd_help() {
 	echo "Usage: dockroute <command>"
 	echo ""
 	echo "Commands:"
-	echo "  start     Start the proxy"
-	echo "  stop      Stop the proxy"
-	echo "  status    Show proxy status and routed services"
-	echo "  check     Check a compose file for dockroute issues"
-	echo "  logs      Follow proxy logs"
-	echo "  ensure    Start proxy if not running (for scripts)"
-	echo "  version   Show version"
-	echo "  help      Show this help"
+	echo "  start       Start the proxy"
+	echo "  stop        Stop the proxy"
+	echo "  status      Show proxy status and routed services"
+	echo "  check       Check a compose file for dockroute issues"
+	echo "  logs        Follow proxy logs"
+	echo "  ensure      Start proxy if not running (for scripts)"
+	echo "  tls setup   Generate TLS certs for PostgreSQL routing"
+	echo "  tls status  Show TLS certificate status"
+	echo "  tls remove  Remove TLS certs and config"
+	echo "  version     Show version"
+	echo "  help        Show this help"
 	echo ""
-	echo "Project Setup:"
+	echo "Project Setup (HTTP):"
 	echo "  Add to your docker-compose.yml:"
 	echo ""
 	echo "    services:"
@@ -726,6 +1091,24 @@ cmd_help() {
 	echo "    networks:"
 	echo "      dockroute:"
 	echo "        external: true"
+	echo ""
+	echo "PostgreSQL Routing (after 'dockroute tls setup'):"
+	echo ""
+	echo "    services:"
+	echo "      db:"
+	echo "        image: postgres:16"
+	echo "        labels:"
+	echo "          - \"traefik.enable=true\""
+	echo "          - \"traefik.tcp.routers.myapp-db.rule=HostSNI(\\\`myapp-db.localhost\\\`)\""
+	echo "          - \"traefik.tcp.routers.myapp-db.entrypoints=postgres\""
+	echo "          - \"traefik.tcp.routers.myapp-db.tls=true\""
+	echo "          - \"traefik.tcp.services.myapp-db.loadbalancer.server.port=5432\""
+	echo "        networks:"
+	echo "          - dockroute"
+	echo "          - default"
+	echo ""
+	echo "  Connect: psql \"host=myapp-db.localhost sslmode=require\""
+	echo "  Drizzle: DATABASE_URL=postgres://user:pass@myapp-db.localhost:5432/db?sslmode=require"
 }
 
 case "${1:-}" in
@@ -735,6 +1118,7 @@ status) cmd_status ;;
 check) cmd_check "$@" ;;
 logs) cmd_logs ;;
 ensure) cmd_ensure ;;
+tls) cmd_tls "$@" ;;
 version) cmd_version ;;
 -v) cmd_version ;;
 --version) cmd_version ;;
