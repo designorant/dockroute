@@ -293,7 +293,7 @@ psql "host=myapp-db.localhost sslmode=require"       → Project A's Postgres
 psql "host=storefront-db.localhost sslmode=require"   → Project B's Postgres
 ```
 
-This works via PostgreSQL's STARTTLS protocol: clients initiate TLS with an SNI hostname, and Traefik routes to the correct backend. Requires `sslmode=require` in all connections.
+Unlike HTTPS where TLS starts immediately, PostgreSQL uses STARTTLS — clients send a plain `SSLRequest` packet first, then upgrade to TLS. Traefik handles this natively: it recognizes the PostgreSQL negotiation, responds to it, then extracts the SNI hostname from the subsequent TLS handshake to route to the correct backend. This is why `sslmode=require` is mandatory — without it, the TLS handshake never happens and there's no hostname to route on.
 
 ### Setup
 
