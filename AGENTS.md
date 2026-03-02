@@ -118,13 +118,31 @@ For apps running natively on the host (not in Docker), use `dockroute route` ins
 ```bash
 dockroute route add myapp.localhost 3000          # HTTP only
 dockroute route add myapp.localhost 3000 --https  # HTTP + HTTPS (requires tls setup)
+dockroute route add myapp-db.localhost 5432 --tcp # TCP/PostgreSQL (requires tls setup)
 ```
 
 - Use `dockroute route` when: the app runs natively (e.g., `npm run dev` on the host)
 - Use Docker labels when: the app runs in a Docker container
+- `--tcp` routes use `HostSNI()` on the `postgres` entrypoint — connect with `sslmode=require`
+- `--https` and `--tcp` are mutually exclusive
 - Hostnames must be flat `<name>.localhost` — no nested subdomains
 - `dockroute.localhost` is reserved for the dashboard
 - If both a Docker container and a host route claim the same hostname, `route add` will fail
+
+### x-dockroute compose extension
+
+Declare host routes in `docker-compose.yml` so `dockroute check` can validate them:
+
+```yaml
+x-dockroute:
+  routes:
+    - "myapp.localhost 3000"
+    - "myapp-api.localhost 3001 https"
+    - "myapp-db.localhost 5432 tcp"
+```
+
+- Format: `<hostname> <port> [https|tcp]` — same as the routes file
+- `dockroute check` validates format, checks registration, and detects collisions with Docker labels
 
 ### Label format
 

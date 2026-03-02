@@ -61,43 +61,97 @@ generate_routes_config() {
 	fi
 
 	local tmp="${ROUTES_DYNAMIC}.tmp"
+	local has_http=false
+	local has_tcp=false
+	while IFS=' ' read -r hostname port flags; do
+		[[ -z "$hostname" || "$hostname" == \#* ]] && continue
+		if [[ "$flags" == "tcp" ]]; then
+			has_tcp=true
+		else
+			has_http=true
+		fi
+	done <"$ROUTES_FILE"
+
+	# Nothing to emit: TCP-only routes when TLS is inactive
+	if [[ "$has_http" == false ]] && { [[ "$has_tcp" == false ]] || ! tls_active; }; then
+		rm -f "$ROUTES_DYNAMIC"
+		return
+	fi
+
 	{
-		echo "http:"
-		echo "  routers:"
+		if [[ "$has_http" == true ]]; then
+			echo "http:"
+			echo "  routers:"
 
-		while IFS=' ' read -r hostname port flags; do
-			[[ -z "$hostname" || "$hostname" == \#* ]] && continue
-			local name
-			name=$(echo "$hostname" | tr '.' '-')
+			while IFS=' ' read -r hostname port flags; do
+				[[ -z "$hostname" || "$hostname" == \#* ]] && continue
+				[[ "$flags" == "tcp" ]] && continue
+				local name
+				name=$(echo "$hostname" | tr '.' '-')
 
-			echo "    ${name}:"
-			echo "      rule: \"Host(\`${hostname}\`)\""
-			echo "      service: ${name}"
-			echo "      entryPoints:"
-			echo "        - web"
-
-			if [[ "$flags" == "https" ]] && tls_active; then
-				echo "    ${name}-secure:"
+				echo "    ${name}:"
 				echo "      rule: \"Host(\`${hostname}\`)\""
 				echo "      service: ${name}"
 				echo "      entryPoints:"
-				echo "        - websecure"
+				echo "        - web"
+
+				if [[ "$flags" == "https" ]] && tls_active; then
+					echo "    ${name}-secure:"
+					echo "      rule: \"Host(\`${hostname}\`)\""
+					echo "      service: ${name}"
+					echo "      entryPoints:"
+					echo "        - websecure"
+					echo "      tls: {}"
+				fi
+			done <"$ROUTES_FILE"
+
+			echo "  services:"
+
+			while IFS=' ' read -r hostname port flags; do
+				[[ -z "$hostname" || "$hostname" == \#* ]] && continue
+				[[ "$flags" == "tcp" ]] && continue
+				local name
+				name=$(echo "$hostname" | tr '.' '-')
+
+				echo "    ${name}:"
+				echo "      loadBalancer:"
+				echo "        servers:"
+				echo "          - url: \"http://host.docker.internal:${port}\""
+			done <"$ROUTES_FILE"
+		fi
+
+		if [[ "$has_tcp" == true ]] && tls_active; then
+			echo "tcp:"
+			echo "  routers:"
+
+			while IFS=' ' read -r hostname port flags; do
+				[[ -z "$hostname" || "$hostname" == \#* ]] && continue
+				[[ "$flags" != "tcp" ]] && continue
+				local name
+				name=$(echo "$hostname" | tr '.' '-')
+
+				echo "    ${name}:"
+				echo "      rule: \"HostSNI(\`${hostname}\`)\""
+				echo "      service: ${name}"
+				echo "      entryPoints:"
+				echo "        - postgres"
 				echo "      tls: {}"
-			fi
-		done <"$ROUTES_FILE"
+			done <"$ROUTES_FILE"
 
-		echo "  services:"
+			echo "  services:"
 
-		while IFS=' ' read -r hostname port flags; do
-			[[ -z "$hostname" || "$hostname" == \#* ]] && continue
-			local name
-			name=$(echo "$hostname" | tr '.' '-')
+			while IFS=' ' read -r hostname port flags; do
+				[[ -z "$hostname" || "$hostname" == \#* ]] && continue
+				[[ "$flags" != "tcp" ]] && continue
+				local name
+				name=$(echo "$hostname" | tr '.' '-')
 
-			echo "    ${name}:"
-			echo "      loadBalancer:"
-			echo "        servers:"
-			echo "          - url: \"http://host.docker.internal:${port}\""
-		done <"$ROUTES_FILE"
+				echo "    ${name}:"
+				echo "      loadBalancer:"
+				echo "        servers:"
+				echo "          - address: \"host.docker.internal:${port}\""
+			done <"$ROUTES_FILE"
+		fi
 	} >"$tmp"
 
 	mv "$tmp" "$ROUTES_DYNAMIC"
@@ -351,9 +405,9 @@ cmd_route() {
 	*)
 		echo "Usage: dockroute route <add|list|remove>"
 		echo ""
-		echo "  add <hostname> <port> [--https]   Route hostname to a local port"
-		echo "  list                               List host routes"
-		echo "  remove <hostname>                  Remove a host route"
+		echo "  add <hostname> <port> [--https|--tcp]  Route hostname to a local port"
+		echo "  list                                    List host routes"
+		echo "  remove <hostname>                       Remove a host route"
 		;;
 	esac
 }
@@ -362,12 +416,17 @@ cmd_route_add() {
 	local hostname=""
 	local port=""
 	local https_flag=""
+	local tcp_flag=""
 
 	# Parse arguments
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--https)
 			https_flag="https"
+			shift
+			;;
+		--tcp)
+			tcp_flag="tcp"
 			shift
 			;;
 		*)
@@ -377,7 +436,7 @@ cmd_route_add() {
 				port="$1"
 			else
 				echo -e "${RED}Error: Unexpected argument: $1${NC}"
-				echo "Usage: dockroute route add <hostname> <port> [--https]"
+				echo "Usage: dockroute route add <hostname> <port> [--https|--tcp]"
 				exit 1
 			fi
 			shift
@@ -385,9 +444,15 @@ cmd_route_add() {
 		esac
 	done
 
+	# Validate mutually exclusive flags
+	if [[ -n "$https_flag" && -n "$tcp_flag" ]]; then
+		echo -e "${RED}Error: --https and --tcp are mutually exclusive${NC}"
+		exit 1
+	fi
+
 	# Validate hostname
 	if [[ -z "$hostname" || -z "$port" ]]; then
-		echo "Usage: dockroute route add <hostname> <port> [--https]"
+		echo "Usage: dockroute route add <hostname> <port> [--https|--tcp]"
 		echo ""
 		echo "Example: dockroute route add myapp.localhost 3000"
 		exit 1
@@ -412,31 +477,53 @@ cmd_route_add() {
 		exit 1
 	fi
 
-	# Validate --https requires TLS
+	# Validate --https/--tcp requires TLS
 	if [[ -n "$https_flag" ]] && ! tls_active; then
 		echo -e "${RED}Error: --https requires TLS to be set up${NC}"
 		echo "  Run: dockroute tls setup"
 		exit 1
 	fi
+	if [[ -n "$tcp_flag" ]] && ! tls_active; then
+		echo -e "${RED}Error: --tcp requires TLS to be set up${NC}"
+		echo "  Run: dockroute tls setup"
+		exit 1
+	fi
+
+	local route_flags="${https_flag}${tcp_flag}"
 
 	# Collision detection: check Traefik API for Docker-provided routes
 	if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${PROXY_NAME}$"; then
-		local routers
-		routers=$(curl -s http://dockroute.localhost/api/http/routers 2>/dev/null || echo "")
 		# shellcheck disable=SC2016
 		local host_re='Host\(`'"${hostname}"'`\)'
-		if echo "$routers" | grep -q "@docker" && echo "$routers" | grep -q "$host_re"; then
+		# shellcheck disable=SC2016
+		local sni_re='HostSNI\(`'"${hostname}"'`\)'
+
+		# HTTP — split into per-router fragments so both conditions match the same router
+		local routers
+		routers=$(curl -s http://dockroute.localhost/api/http/routers 2>/dev/null || echo "")
+		if echo "$routers" | sed 's/},/}\n/g' | grep "@docker" | grep -q "$host_re"; then
 			echo -e "${RED}Error: '${hostname}' is already routed by a Docker container${NC}"
 			echo "  Remove the Traefik labels from the container or use a different hostname"
 			exit 1
 		fi
+
+		# TCP — only check for --tcp routes
+		if [[ -n "$tcp_flag" ]]; then
+			local tcp_routers
+			tcp_routers=$(curl -s http://dockroute.localhost/api/tcp/routers 2>/dev/null || echo "")
+			if echo "$tcp_routers" | sed 's/},/}\n/g' | grep "@docker" | grep -q "$sni_re"; then
+				echo -e "${RED}Error: '${hostname}' is already routed by a Docker container (TCP)${NC}"
+				echo "  Remove the TCP labels from the container or use a different hostname"
+				exit 1
+			fi
+		fi
 	fi
 
-	# Check for no-op (same hostname + port + https state)
+	# Check for no-op (same hostname + port + flags)
 	if [[ -f "$ROUTES_FILE" ]]; then
 		local existing
 		existing=$(grep "^${hostname} " "$ROUTES_FILE" 2>/dev/null || echo "")
-		if [[ "$existing" == "${hostname} ${port}${https_flag:+ ${https_flag}}" ]]; then
+		if [[ "$existing" == "${hostname} ${port}${route_flags:+ ${route_flags}}" ]]; then
 			echo -e "${GREEN}✓ Route already exists: ${hostname} → localhost:${port}${NC}"
 			return
 		fi
@@ -448,13 +535,15 @@ cmd_route_add() {
 		grep -v "^${hostname} " "$ROUTES_FILE" >"${ROUTES_FILE}.tmp" || true
 		mv "${ROUTES_FILE}.tmp" "$ROUTES_FILE"
 	fi
-	echo "${hostname} ${port}${https_flag:+ ${https_flag}}" >>"$ROUTES_FILE"
+	echo "${hostname} ${port}${route_flags:+ ${route_flags}}" >>"$ROUTES_FILE"
 
 	# Generate Traefik config
 	generate_routes_config
 
 	echo -e "${GREEN}✓ Route added: ${hostname} → localhost:${port}${NC}"
-	if [[ -n "$https_flag" ]]; then
+	if [[ -n "$tcp_flag" ]]; then
+		echo "  ${hostname}:5432 → localhost:${port} (tcp, sslmode=require)"
+	elif [[ -n "$https_flag" ]]; then
 		echo "  http://${hostname}"
 		echo "  https://${hostname}"
 	else
@@ -476,12 +565,20 @@ cmd_route_list() {
 	echo "Host routes:"
 	while IFS=' ' read -r hostname port flags; do
 		[[ -z "$hostname" || "$hostname" == \#* ]] && continue
-		echo "  http://${hostname} → localhost:${port}"
-		if [[ "$flags" == "https" ]]; then
+		if [[ "$flags" == "tcp" ]]; then
 			if tls_active; then
-				echo "  https://${hostname} → localhost:${port}"
+				echo "  ${hostname}:5432 → localhost:${port} (tcp, sslmode=require)"
 			else
-				echo "  (https pending tls setup)"
+				echo "  ${hostname}:5432 → localhost:${port} (tcp pending tls setup)"
+			fi
+		else
+			echo "  http://${hostname} → localhost:${port}"
+			if [[ "$flags" == "https" ]]; then
+				if tls_active; then
+					echo "  https://${hostname} → localhost:${port}"
+				else
+					echo "  (https pending tls setup)"
+				fi
 			fi
 		fi
 	done <"$ROUTES_FILE"
@@ -1200,8 +1297,167 @@ cmd_check() {
 			need_suggestion=true
 		fi
 
+		# H1: Label hostname collides with a host route
+		if [[ -f "$ROUTES_FILE" ]]; then
+			local labels
+			labels=$(_kv_get "${svc}.traefik_labels")
+			# shellcheck disable=SC2016
+			local label_host_re='Host\(`([^`]+)`\)'
+			# shellcheck disable=SC2016
+			local label_sni_re='HostSNI\(`([^`]+)`\)'
+			while IFS= read -r lbl; do
+				[[ -z "$lbl" ]] && continue
+				if [[ "$lbl" =~ $label_host_re ]]; then
+					local lbl_hostname="${BASH_REMATCH[1]}"
+					if grep -q "^${lbl_hostname} " "$ROUTES_FILE"; then
+						issues+="${YELLOW}!${NC} Hostname '${lbl_hostname}' collides with a host route (dockroute route list)"$'\n'
+						warnings=$((warnings + 1))
+					fi
+				fi
+				if [[ "$lbl" =~ $label_sni_re && "${BASH_REMATCH[1]}" != "*" ]]; then
+					local lbl_hostname="${BASH_REMATCH[1]}"
+					if grep -q "^${lbl_hostname} " "$ROUTES_FILE"; then
+						issues+="${YELLOW}!${NC} TCP hostname '${lbl_hostname}' collides with a host route (dockroute route list)"$'\n'
+						warnings=$((warnings + 1))
+					fi
+				fi
+			done <<<"$labels"
+		fi
+
 		_kv_set "${svc}.issues" "$issues"
 	done
+
+	# Parse x-dockroute: routes: from docker compose config output
+	local xdockroute_routes=()
+	local in_xdockroute=false
+	local in_xroutes=false
+	while IFS= read -r line; do
+		if [[ "$line" == "x-dockroute:" ]]; then
+			in_xdockroute=true
+			continue
+		fi
+		if [[ "$in_xdockroute" == true && "$line" =~ ^[a-zA-Z] ]]; then
+			in_xdockroute=false
+			in_xroutes=false
+			continue
+		fi
+		if [[ "$in_xdockroute" == true && "$line" =~ ^\ \ routes: ]]; then
+			in_xroutes=true
+			continue
+		fi
+		if [[ "$in_xroutes" == true && "$line" =~ ^\ \ [a-zA-Z] ]]; then
+			in_xroutes=false
+			continue
+		fi
+		if [[ "$in_xroutes" == true && "$line" =~ ^\ {4}-\ (.+) ]]; then
+			local entry="${BASH_REMATCH[1]}"
+			# Strip surrounding quotes that docker compose config may add
+			entry="${entry%\"}"
+			entry="${entry#\"}"
+			xdockroute_routes+=("$entry")
+		fi
+	done <<<"$config"
+
+	# X1: Validate x-dockroute route entries
+	local xdockroute_issues=""
+	local xdockroute_hostnames=()
+	local hostname_re='^[a-z0-9]([a-z0-9-]*[a-z0-9])?\.localhost$'
+
+	for route in "${xdockroute_routes[@]}"; do
+		local r_host r_port r_flags r_extra
+		read -r r_host r_port r_flags r_extra <<<"$route"
+
+		# Extra fields
+		if [[ -n "$r_extra" ]]; then
+			xdockroute_issues+="${RED}✗${NC} x-dockroute: '${route}' — too many fields"$'\n'
+			errors=$((errors + 1))
+			continue
+		fi
+
+		# Invalid hostname
+		if ! [[ "$r_host" =~ $hostname_re ]]; then
+			xdockroute_issues+="${RED}✗${NC} x-dockroute: invalid hostname '${r_host}'"$'\n'
+			errors=$((errors + 1))
+			continue
+		fi
+
+		# Reserved hostname
+		if [[ "$r_host" == "dockroute.localhost" ]]; then
+			xdockroute_issues+="${RED}✗${NC} x-dockroute: 'dockroute.localhost' is reserved"$'\n'
+			errors=$((errors + 1))
+			continue
+		fi
+
+		# Missing/invalid port
+		if ! [[ "$r_port" =~ ^[0-9]+$ ]] || [[ "$r_port" -lt 1 || "$r_port" -gt 65535 ]]; then
+			xdockroute_issues+="${RED}✗${NC} x-dockroute: invalid port '${r_port}' for '${r_host}'"$'\n'
+			errors=$((errors + 1))
+			continue
+		fi
+
+		# Unknown flag
+		if [[ -n "$r_flags" && "$r_flags" != "https" && "$r_flags" != "tcp" ]]; then
+			xdockroute_issues+="${RED}✗${NC} x-dockroute: unknown flag '${r_flags}' for '${r_host}'"$'\n'
+			errors=$((errors + 1))
+			continue
+		fi
+
+		xdockroute_hostnames+=("$r_host")
+
+		# TLS requirement warning
+		if [[ -n "$r_flags" ]] && ! tls_active; then
+			xdockroute_issues+="${YELLOW}!${NC} x-dockroute: '${r_host}' (${r_flags}) requires tls setup"$'\n'
+			warnings=$((warnings + 1))
+		fi
+
+		# Check registration in routes file
+		if [[ -f "$ROUTES_FILE" ]]; then
+			local registered=false
+			while IFS=' ' read -r f_host f_port f_flags; do
+				[[ -z "$f_host" || "$f_host" == \#* ]] && continue
+				if [[ "$f_host" == "$r_host" && "$f_port" == "$r_port" && "${f_flags:-}" == "${r_flags:-}" ]]; then
+					registered=true
+					break
+				fi
+			done <"$ROUTES_FILE"
+			if [[ "$registered" == false ]]; then
+				xdockroute_issues+="${YELLOW}!${NC} x-dockroute: '${r_host}' not registered — run: dockroute route add ${r_host} ${r_port}${r_flags:+ --${r_flags}}"$'\n'
+				warnings=$((warnings + 1))
+			fi
+		else
+			xdockroute_issues+="${YELLOW}!${NC} x-dockroute: '${r_host}' not registered — run: dockroute route add ${r_host} ${r_port}${r_flags:+ --${r_flags}}"$'\n'
+			warnings=$((warnings + 1))
+		fi
+	done
+
+	# Self-collision: label hostnames vs x-dockroute hostnames
+	if [[ ${#xdockroute_hostnames[@]} -gt 0 ]]; then
+		for svc in "${services[@]}"; do
+			local labels
+			labels=$(_kv_get "${svc}.traefik_labels")
+			# shellcheck disable=SC2016
+			local label_host_re='Host\(`([^`]+)`\)'
+			# shellcheck disable=SC2016
+			local label_sni_re='HostSNI\(`([^`]+)`\)'
+			while IFS= read -r lbl; do
+				[[ -z "$lbl" ]] && continue
+				local lbl_hostname=""
+				if [[ "$lbl" =~ $label_host_re ]]; then
+					lbl_hostname="${BASH_REMATCH[1]}"
+				elif [[ "$lbl" =~ $label_sni_re && "${BASH_REMATCH[1]}" != "*" ]]; then
+					lbl_hostname="${BASH_REMATCH[1]}"
+				fi
+				if [[ -n "$lbl_hostname" ]]; then
+					for xh in "${xdockroute_hostnames[@]}"; do
+						if [[ "$xh" == "$lbl_hostname" ]]; then
+							xdockroute_issues+="${YELLOW}!${NC} x-dockroute: '${lbl_hostname}' also claimed by service '${svc}' labels — will conflict"$'\n'
+							warnings=$((warnings + 1))
+						fi
+					done
+				fi
+			done <<<"$labels"
+		done
+	fi
 
 	# N1: Missing dockroute network declaration
 	local network_error=false
@@ -1226,6 +1482,20 @@ cmd_check() {
 		fi
 		echo ""
 	done
+
+	# Print x-dockroute results
+	if [[ -n "$xdockroute_issues" ]]; then
+		echo "  x-dockroute:"
+		while IFS= read -r issue; do
+			[[ -z "$issue" ]] && continue
+			echo -e "    ${issue}"
+		done <<<"$xdockroute_issues"
+		echo ""
+	elif [[ ${#xdockroute_routes[@]} -gt 0 ]]; then
+		echo "  x-dockroute:"
+		echo -e "    ${GREEN}✓${NC} All routes valid and registered"
+		echo ""
+	fi
 
 	if [[ "$network_error" == true ]]; then
 		echo -e "  ${RED}✗${NC} Missing dockroute network declaration"
@@ -1414,8 +1684,10 @@ cmd_help() {
 	echo ""
 	echo "    dockroute route add myapp.localhost 3000"
 	echo "    dockroute route add myapp.localhost 3000 --https"
+	echo "    dockroute route add myapp-db.localhost 5432 --tcp"
 	echo ""
-	echo "  Then access at: http://myapp.localhost"
+	echo "  HTTP/HTTPS: access at http://myapp.localhost"
+	echo "  TCP: connect with psql \"host=myapp-db.localhost sslmode=require\""
 	echo ""
 	echo "Project Setup (Docker containers):"
 	echo "  Add to your docker-compose.yml:"

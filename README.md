@@ -259,17 +259,48 @@ This creates a Traefik file-provider route pointing at `host.docker.internal:<po
 ```bash
 dockroute route add myapp.localhost 3000          # Add a route
 dockroute route add myapp.localhost 3000 --https  # Add with HTTPS (requires tls setup)
+dockroute route add myapp-db.localhost 5432 --tcp # Add TCP route (requires tls setup)
 dockroute route list                              # List all host routes
 dockroute route remove myapp.localhost            # Remove a route
 ```
+
+### TCP Host Routes
+
+Route TCP traffic (e.g., PostgreSQL) to a native process on your machine — no Docker container needed:
+
+```bash
+# Route to a local Postgres server
+dockroute route add myapp-db.localhost 5432 --tcp
+
+# Connect via hostname
+psql "host=myapp-db.localhost sslmode=require"
+```
+
+TCP routes use Traefik's `HostSNI()` routing over the `postgres` entrypoint (port 5432). The route port is the target port on your machine — often 5432, but can differ if your local Postgres listens elsewhere.
 
 ### Rules
 
 - Hostnames must be flat `<name>.localhost` — nested subdomains (e.g., `mail.myapp.localhost`) are not supported
 - `dockroute.localhost` is reserved for the dashboard
 - `--https` requires `dockroute tls setup` and creates dual-stack routing (HTTP + HTTPS)
+- `--tcp` requires `dockroute tls setup` and routes via `HostSNI()` on the postgres entrypoint
+- `--https` and `--tcp` are mutually exclusive
 - If a Docker container already claims the same hostname, `route add` will fail — remove the container's labels or choose a different hostname
-- Running `dockroute route add` with the same hostname replaces the existing entry (port, https state)
+- Running `dockroute route add` with the same hostname replaces the existing entry (port, flags)
+
+### Declaring Host Routes in Compose Files
+
+You can declare host routes in your `docker-compose.yml` using the `x-dockroute` extension. This lets `dockroute check` validate that the routes are registered:
+
+```yaml
+x-dockroute:
+  routes:
+    - "myapp.localhost 3000"
+    - "myapp-api.localhost 3001 https"
+    - "myapp-db.localhost 5432 tcp"
+```
+
+`dockroute check` will verify each entry's format (hostname, port, flags) and warn if a route isn't registered yet. It also detects conflicts between x-dockroute hostnames and Docker container labels in the same file.
 
 ## HTTPS Routing
 
@@ -451,7 +482,7 @@ export const instance = new Proxy({} as MyType, {
 | `dockroute check [path]` | Check a compose file for dockroute issues |
 | `dockroute logs` | Follow proxy logs |
 | `dockroute ensure` | Start if not running (for scripts) |
-| `dockroute route add <host> <port>` | Route hostname to a local port |
+| `dockroute route add <host> <port> [--https\|--tcp]` | Route hostname to a local port |
 | `dockroute route list` | List host routes |
 | `dockroute route remove <host>` | Remove a host route |
 | `dockroute tls setup` | Generate TLS certs for HTTPS and PostgreSQL routing |
