@@ -73,6 +73,7 @@ db:
   image: postgres:16
   labels:
     - "traefik.enable=true"
+    - "traefik.docker.network=dockroute"
     - "traefik.tcp.routers.<prefix>-db.rule=HostSNI(`<prefix>-db.localhost`)"
     - "traefik.tcp.routers.<prefix>-db.entrypoints=postgres"
     - "traefik.tcp.routers.<prefix>-db.tls=true"
@@ -87,11 +88,36 @@ db:
 - TCP router names must be project-scoped (e.g., `myapp-db`, not `db` or `postgres`)
 - Do NOT use `HostSNI(*)` — it prevents multi-project routing
 
+### Redis services — TCP labels for hostname routing
+
+Redis services can use TCP labels for hostname routing, similar to PostgreSQL. This requires a one-time `dockroute tls setup`.
+
+```yaml
+redis:
+  image: redis:alpine
+  labels:
+    - "traefik.enable=true"
+    - "traefik.docker.network=dockroute"
+    - "traefik.tcp.routers.<prefix>-redis.rule=HostSNI(`<prefix>-redis.localhost`)"
+    - "traefik.tcp.routers.<prefix>-redis.entrypoints=redis"
+    - "traefik.tcp.routers.<prefix>-redis.tls=true"
+    - "traefik.tcp.services.<prefix>-redis.loadbalancer.server.port=6379"
+  networks:
+    - dockroute
+    - default
+```
+
+- Host connections use TLS: `rediss://<prefix>-redis.localhost:6379` (note double `s` in `rediss://`)
+- Internal app connections are unchanged: `redis://redis:6379` (no TLS needed)
+- TCP router names must be project-scoped (e.g., `myapp-redis`, not `redis` or `cache`)
+- Do NOT use `HostSNI(*)` — it prevents multi-project routing
+- For Node.js: set `NODE_EXTRA_CA_CERTS="$(mkcert -CAROOT)/rootCA.pem"` to trust the mkcert CA
+
 ### Other internal services — remove `ports:`
 
-Caches and message brokers (mysql, redis, memcached, rabbitmq, elasticsearch) should have no `ports:` mapping. Apps connect via Docker's internal network using the service name (e.g., `redis://redis:6379`).
+Caches and message brokers (mysql, memcached, rabbitmq, elasticsearch) should have no `ports:` mapping. Apps connect via Docker's internal network using the service name.
 
-If a port is exposed for host-side GUI tools (TablePlus, RedisInsight), use an environment variable: `"${REDIS_PORT:-6379}:6379"` with the port set in `.env`.
+If a port is exposed for host-side GUI tools (TablePlus, etc.), use an environment variable: `"${MYSQL_PORT:-3306}:3306"` with the port set in `.env`.
 
 ### Supporting services — flat subdomain pattern
 
@@ -123,7 +149,7 @@ dockroute route add myapp-db.localhost 5432 --tcp # TCP/PostgreSQL (requires tls
 
 - Use `dockroute route` when: the app runs natively (e.g., `npm run dev` on the host)
 - Use Docker labels when: the app runs in a Docker container
-- `--tcp` routes use `HostSNI()` on the `postgres` entrypoint — connect with `sslmode=require`
+- `--tcp` routes use `HostSNI()` on the `postgres` entrypoint (port 5432) — connect with `sslmode=require`
 - `--https` and `--tcp` are mutually exclusive
 - Hostnames must be flat `<name>.localhost` — no nested subdomains
 - `dockroute.localhost` is reserved for the dashboard

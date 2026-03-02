@@ -209,7 +209,7 @@ Everything routes through port 80 (or 443 with TLS) using hostnames — no port 
 | WebSockets | `localhost:6001` | `http://myapp-ws.localhost` | `https://myapp-ws.localhost` |
 | Mailhog | `localhost:8025` | `http://myapp-mail.localhost` | `https://myapp-mail.localhost` |
 | PostgreSQL | `localhost:5432` | `myapp-db.localhost:5432` (TLS) | — |
-| Redis | `localhost:6379` | Not exposed (internal) | — |
+| Redis | `localhost:6379` | `myapp-redis.localhost:6379` (TLS) | — |
 
 Databases and caches don't need exposed ports — your app connects via Docker's internal network using the service name (e.g., `postgres://user:pass@db:5432/mydb`).
 
@@ -276,14 +276,14 @@ dockroute route add myapp-db.localhost 5432 --tcp
 psql "host=myapp-db.localhost sslmode=require"
 ```
 
-TCP routes use Traefik's `HostSNI()` routing over the `postgres` entrypoint (port 5432). The route port is the target port on your machine — often 5432, but can differ if your local Postgres listens elsewhere.
+TCP routes use Traefik's `HostSNI()` routing over dedicated entrypoints — `postgres` (port 5432) and `redis` (port 6379). The route port is the target port on your machine — often the same as the entrypoint port, but can differ if your local service listens elsewhere.
 
 ### Rules
 
 - Hostnames must be flat `<name>.localhost` — nested subdomains (e.g., `mail.myapp.localhost`) are not supported
 - `dockroute.localhost` is reserved for the dashboard
 - `--https` requires `dockroute tls setup` and creates dual-stack routing (HTTP + HTTPS)
-- `--tcp` requires `dockroute tls setup` and routes via `HostSNI()` on the postgres entrypoint
+- `--tcp` requires `dockroute tls setup` and routes via `HostSNI()` on the postgres entrypoint (port 5432)
 - `--https` and `--tcp` are mutually exclusive
 - If a Docker container already claims the same hostname, `route add` will fail — remove the container's labels or choose a different hostname
 - Running `dockroute route add` with the same hostname replaces the existing entry (port, flags)
@@ -349,16 +349,19 @@ labels:
 
 This creates two routers: `myapp` handles HTTPS, and `myapp-http` catches HTTP requests and redirects them. No global redirect is applied — other services remain HTTP-only.
 
-## PostgreSQL Routing
+## TCP Routing (PostgreSQL & Redis)
 
-For PostgreSQL, dockroute supports hostname-based routing — multiple projects share port 5432, each accessible via its own hostname:
+dockroute supports hostname-based TCP routing — multiple projects share the same port, each accessible via its own hostname:
 
 ```
 psql "host=myapp-db.localhost sslmode=require"       → Project A's Postgres
 psql "host=storefront-db.localhost sslmode=require"   → Project B's Postgres
+redis-cli --tls -h myapp-redis.localhost              → Project A's Redis
 ```
 
-Unlike HTTPS where TLS starts immediately, PostgreSQL uses STARTTLS — clients send a plain `SSLRequest` packet first, then upgrade to TLS. Traefik handles this natively: it recognizes the PostgreSQL negotiation, responds to it, then extracts the SNI hostname from the subsequent TLS handshake to route to the correct backend. This is why `sslmode=require` is mandatory — without it, the TLS handshake never happens and there's no hostname to route on.
+**PostgreSQL** uses STARTTLS — clients send a plain `SSLRequest` packet first, then upgrade to TLS. Traefik handles this natively: it recognizes the PostgreSQL negotiation, responds to it, then extracts the SNI hostname from the subsequent TLS handshake to route to the correct backend. This is why `sslmode=require` is mandatory — without it, the TLS handshake never happens and there's no hostname to route on.
+
+**Redis** uses a dedicated TLS entrypoint on port 6379 where TLS starts immediately (no STARTTLS). Clients connect using the `rediss://` scheme, and Traefik extracts the SNI hostname from the TLS handshake to route to the correct backend.
 
 ### Setup
 
@@ -371,7 +374,7 @@ dockroute stop && dockroute start
 
 ### Project Configuration
 
-Add TCP labels to your PostgreSQL service:
+Add TCP labels to your PostgreSQL and/or Redis services:
 
 ```yaml
 services:
@@ -379,6 +382,7 @@ services:
     image: postgres:16
     labels:
       - "traefik.enable=true"
+      - "traefik.docker.network=dockroute"
       - "traefik.tcp.routers.myapp-db.rule=HostSNI(`myapp-db.localhost`)"
       - "traefik.tcp.routers.myapp-db.entrypoints=postgres"
       - "traefik.tcp.routers.myapp-db.tls=true"
@@ -386,29 +390,53 @@ services:
     networks:
       - dockroute
       - default
+
+  redis:
+    image: redis:alpine
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=dockroute"
+      - "traefik.tcp.routers.myapp-redis.rule=HostSNI(`myapp-redis.localhost`)"
+      - "traefik.tcp.routers.myapp-redis.entrypoints=redis"
+      - "traefik.tcp.routers.myapp-redis.tls=true"
+      - "traefik.tcp.services.myapp-redis.loadbalancer.server.port=6379"
+    networks:
+      - dockroute
+      - default
 ```
 
 No `ports:` mapping needed — Traefik handles it.
 
+**Important:** Services on multiple networks (both `dockroute` and `default`) must set `traefik.docker.network=dockroute`. Without it, Traefik may resolve the wrong network IP.
+
 ### Connecting
 
 ```bash
-# psql
+# PostgreSQL — psql
 psql "host=myapp-db.localhost port=5432 sslmode=require user=postgres"
 
-# Drizzle Kit / ORMs
+# PostgreSQL — ORMs
 DATABASE_URL=postgres://user:pass@myapp-db.localhost:5432/mydb?sslmode=require
+
+# Redis — redis-cli
+redis-cli --tls -h myapp-redis.localhost -p 6379
+
+# Redis — app connection string
+REDIS_URL=rediss://myapp-redis.localhost:6379
 
 # Internal app connections (unchanged, no TLS needed)
 DATABASE_URL=postgres://user:pass@db:5432/mydb
+REDIS_URL=redis://redis:6379
 ```
 
-**Important:** `sslmode=require` is mandatory for host connections. Without it, clients skip TLS and the connection fails.
+**Important:** TLS is mandatory for host connections — `sslmode=require` for PostgreSQL, `rediss://` for Redis. Without it, the TLS handshake never happens and there's no hostname to route on.
+
+**Node.js TLS trust:** If using mkcert certificates, set `NODE_EXTRA_CA_CERTS="$(mkcert -CAROOT)/rootCA.pem"` so Node.js trusts the local CA. For Redis via `ioredis`, you may also need to set `tls.servername` to the dockroute hostname for SNI matching.
 
 ### Limitations
 
-- **PostgreSQL only** — MySQL's server-first protocol prevents SNI extraction; Redis has no STARTTLS support in Traefik
-- **Port 5432 conflict** — if a local PostgreSQL server is running, stop it first or change its port
+- **PostgreSQL and Redis only** — MySQL's server-first protocol prevents SNI extraction
+- **Port conflicts** — if a local PostgreSQL server (5432) or Redis server (6379) is running, stop it first or change its port
 - **Cert expiry** — mkcert certs last ~27 months; check with `dockroute tls status`
 
 ## Gotchas
@@ -485,7 +513,7 @@ export const instance = new Proxy({} as MyType, {
 | `dockroute route add <host> <port> [--https\|--tcp]` | Route hostname to a local port |
 | `dockroute route list` | List host routes |
 | `dockroute route remove <host>` | Remove a host route |
-| `dockroute tls setup` | Generate TLS certs for HTTPS and PostgreSQL routing |
+| `dockroute tls setup` | Generate TLS certs for HTTPS, PostgreSQL, and Redis routing |
 | `dockroute tls status` | Show TLS certificate status |
 | `dockroute tls remove` | Remove TLS certs and config |
 | `dockroute version` | Show version |
@@ -504,7 +532,8 @@ This project uses [dockroute](https://github.com/designorant/dockroute) for loca
 
 - **Web services**: Replace `ports:` with Traefik labels (`traefik.enable=true`, router rule, loadbalancer port). Add both `dockroute` and `default` networks. Use the project directory name as the `<prefix>`.
 - **PostgreSQL**: Use TCP labels for hostname routing (`traefik.tcp.routers.<prefix>-db.rule=HostSNI(...)`, `entrypoints=postgres`, `tls=true`). Requires `dockroute tls setup`. Connect with `sslmode=require` from host.
-- **Internal services** (Redis, MySQL, caches): Remove `ports:` — apps connect via Docker's internal network (e.g., `redis://redis:6379`). For host GUI access, use env var pattern: `"${REDIS_PORT:-6379}:6379"`.
+- **Redis**: Use TCP labels for hostname routing (`traefik.tcp.routers.<prefix>-redis.rule=HostSNI(...)`, `entrypoints=redis`, `tls=true`). Requires `dockroute tls setup`. Connect with `rediss://` from host.
+- **Internal services** (MySQL, caches): Remove `ports:` — apps connect via Docker's internal network. For host GUI access, use env var pattern: `"${MYSQL_PORT:-3306}:3306"`.
 - **Supporting services** (Mailhog, MinIO, etc.): Route through Traefik with flat subdomain: `<prefix>-<service>.localhost` (NOT `<service>.<prefix>.localhost`).
 - **WebSocket services**: Use `<prefix>-ws.localhost` as hostname.
 - **Naming**: Router names and hostnames must be project-scoped (`myapp`, not `app`).

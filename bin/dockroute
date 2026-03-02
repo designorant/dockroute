@@ -4,7 +4,7 @@ set -e
 # dockroute - Local development proxy for Docker
 # Eliminates port conflicts by routing via hostnames
 
-VERSION="2.4.0"
+VERSION="2.5.0"
 PROXY_NAME="dockroute-traefik"
 NETWORK_NAME="dockroute"
 
@@ -195,6 +195,7 @@ EOF
 	if tls_active; then
 		cat >>"$GENERATED_COMPOSE" <<EOF
       - "--entrypoints.postgres.address=:5432"
+      - "--entrypoints.redis.address=:6379"
 EOF
 	fi
 
@@ -211,6 +212,7 @@ EOF
 	if tls_active; then
 		cat >>"$GENERATED_COMPOSE" <<EOF
       - "5432:5432"
+      - "6379:6379"
 EOF
 	fi
 
@@ -345,6 +347,12 @@ cmd_tls_status() {
 				echo -e "${GREEN}✓ PostgreSQL entrypoint active on port 5432${NC}"
 			else
 				echo -e "${YELLOW}! PostgreSQL entrypoint not active — restart proxy${NC}"
+				echo "  dockroute stop && dockroute start"
+			fi
+			if echo "$entrypoints" | grep -q '"redis"'; then
+				echo -e "${GREEN}✓ Redis entrypoint active on port 6379${NC}"
+			else
+				echo -e "${YELLOW}! Redis entrypoint not active — restart proxy${NC}"
 				echo "  dockroute stop && dockroute start"
 			fi
 		else
@@ -670,11 +678,16 @@ cmd_start() {
 		was_running=true
 	fi
 
-	# Check for port 5432 conflict when TLS is active
+	# Check for port conflicts when TLS is active
 	if tls_active; then
 		if lsof -i :5432 -sTCP:LISTEN >/dev/null 2>&1; then
 			echo -e "${YELLOW}Warning: Port 5432 is already in use — PostgreSQL routing will not work${NC}"
 			echo "  Stop the local PostgreSQL server and restart dockroute"
+			echo ""
+		fi
+		if lsof -i :6379 -sTCP:LISTEN >/dev/null 2>&1; then
+			echo -e "${YELLOW}Warning: Port 6379 is already in use — Redis routing will not work${NC}"
+			echo "  Stop the local Redis server and restart dockroute"
 			echo ""
 		fi
 	fi
@@ -695,13 +708,14 @@ cmd_start() {
 	echo "  Projects:  http://<project>.localhost"
 	if tls_active; then
 		echo "  PostgreSQL: <project>-db.localhost:5432 (sslmode=require)"
+		echo "  Redis:      <project>-redis.localhost:6379 (rediss://)"
 	fi
 	if routes_active; then
 		echo "  Host routes: $(wc -l <"$ROUTES_FILE" | tr -d ' ') configured (dockroute route list)"
 	fi
 	if ! tls_active; then
 		echo ""
-		echo -e "  Tip: Run ${GREEN}dockroute tls setup${NC} to enable PostgreSQL hostname routing"
+		echo -e "  Tip: Run ${GREEN}dockroute tls setup${NC} to enable PostgreSQL and Redis hostname routing"
 	fi
 }
 
