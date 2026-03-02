@@ -111,6 +111,21 @@ networks:
     external: true
 ```
 
+### Host routes — native apps running outside Docker
+
+For apps running natively on the host (not in Docker), use `dockroute route` instead of Docker labels:
+
+```bash
+dockroute route add myapp.localhost 3000          # HTTP only
+dockroute route add myapp.localhost 3000 --https  # HTTP + HTTPS (requires tls setup)
+```
+
+- Use `dockroute route` when: the app runs natively (e.g., `npm run dev` on the host)
+- Use Docker labels when: the app runs in a Docker container
+- Hostnames must be flat `<name>.localhost` — no nested subdomains
+- `dockroute.localhost` is reserved for the dashboard
+- If both a Docker container and a host route claim the same hostname, `route add` will fail
+
 ### Label format
 
 Always use double-quoted label strings with backtick-enclosed hostnames:

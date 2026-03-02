@@ -4,7 +4,7 @@ set -e
 # dockroute - Local development proxy for Docker
 # Eliminates port conflicts by routing via hostnames
 
-VERSION="2.3.0"
+VERSION="2.4.0"
 PROXY_NAME="dockroute-traefik"
 NETWORK_NAME="dockroute"
 
@@ -34,78 +34,154 @@ DOCKROUTE_DIR="${HOME}/.dockroute"
 CERTS_DIR="${DOCKROUTE_DIR}/certs"
 DYNAMIC_CONFIG="${DOCKROUTE_DIR}/traefik-dynamic.yml"
 GENERATED_COMPOSE="${DOCKROUTE_DIR}/docker-compose.yml"
+DYNAMIC_DIR="${DOCKROUTE_DIR}/dynamic"
+ROUTES_FILE="${DOCKROUTE_DIR}/routes"
+ROUTES_DYNAMIC="${DYNAMIC_DIR}/routes.yml"
+TLS_DYNAMIC="${DYNAMIC_DIR}/tls.yml"
 
 tls_active() {
 	[[ -f "${CERTS_DIR}/cert.pem" && -f "${CERTS_DIR}/key.pem" ]]
 }
 
+routes_active() { [[ -s "${ROUTES_FILE}" ]]; }
+
+migrate_dynamic_config() {
+	if [[ -f "$DYNAMIC_CONFIG" && ! -f "$TLS_DYNAMIC" ]]; then
+		mkdir -p "$DYNAMIC_DIR"
+		mv "$DYNAMIC_CONFIG" "$TLS_DYNAMIC"
+	fi
+}
+
+generate_routes_config() {
+	mkdir -p "$DYNAMIC_DIR"
+
+	if ! routes_active; then
+		rm -f "$ROUTES_DYNAMIC"
+		return
+	fi
+
+	local tmp="${ROUTES_DYNAMIC}.tmp"
+	{
+		echo "http:"
+		echo "  routers:"
+
+		while IFS=' ' read -r hostname port flags; do
+			[[ -z "$hostname" || "$hostname" == \#* ]] && continue
+			local name
+			name=$(echo "$hostname" | tr '.' '-')
+
+			echo "    ${name}:"
+			echo "      rule: \"Host(\`${hostname}\`)\""
+			echo "      service: ${name}"
+			echo "      entryPoints:"
+			echo "        - web"
+
+			if [[ "$flags" == "https" ]] && tls_active; then
+				echo "    ${name}-secure:"
+				echo "      rule: \"Host(\`${hostname}\`)\""
+				echo "      service: ${name}"
+				echo "      entryPoints:"
+				echo "        - websecure"
+				echo "      tls: {}"
+			fi
+		done <"$ROUTES_FILE"
+
+		echo "  services:"
+
+		while IFS=' ' read -r hostname port flags; do
+			[[ -z "$hostname" || "$hostname" == \#* ]] && continue
+			local name
+			name=$(echo "$hostname" | tr '.' '-')
+
+			echo "    ${name}:"
+			echo "      loadBalancer:"
+			echo "        servers:"
+			echo "          - url: \"http://host.docker.internal:${port}\""
+		done <"$ROUTES_FILE"
+	} >"$tmp"
+
+	mv "$tmp" "$ROUTES_DYNAMIC"
+}
+
+reconcile_proxy() {
+	if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${PROXY_NAME}$"; then
+		echo "  Start the proxy to activate: dockroute start"
+		return
+	fi
+
+	migrate_dynamic_config
+	generate_compose
+	local compose
+	compose=$(active_compose)
+	docker compose -f "$compose" -p dockroute up -d >/dev/null 2>&1
+
+	echo "  Route active"
+}
+
 generate_compose() {
 	mkdir -p "$DOCKROUTE_DIR"
+	mkdir -p "$DYNAMIC_DIR"
+
+	cat >"$GENERATED_COMPOSE" <<EOF
+services:
+  traefik:
+    image: traefik:v3
+    container_name: dockroute-traefik
+    restart: unless-stopped
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
+EOF
 
 	if tls_active; then
-		cat >"$GENERATED_COMPOSE" <<EOF
-services:
-  traefik:
-    image: traefik:v3
-    container_name: dockroute-traefik
-    restart: unless-stopped
-    command:
-      - "--api.insecure=true"
-      - "--providers.docker=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--entrypoints.web.address=:80"
-      - "--entrypoints.websecure.address=:443"
+		cat >>"$GENERATED_COMPOSE" <<EOF
       - "--entrypoints.postgres.address=:5432"
-      - "--providers.file.filename=/etc/traefik/dynamic.yml"
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.dockroute.rule=Host(\`dockroute.localhost\`)"
-      - "traefik.http.services.dockroute.loadbalancer.server.port=8080"
-    ports:
-      - "80:80"
-      - "443:443"
-      - "5432:5432"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ${CERTS_DIR}:/etc/traefik/certs:ro
-      - ${DYNAMIC_CONFIG}:/etc/traefik/dynamic.yml:ro
-    networks:
-      - dockroute
-
-networks:
-  dockroute:
-    external: true
-EOF
-	else
-		cat >"$GENERATED_COMPOSE" <<EOF
-services:
-  traefik:
-    image: traefik:v3
-    container_name: dockroute-traefik
-    restart: unless-stopped
-    command:
-      - "--api.insecure=true"
-      - "--providers.docker=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--entrypoints.web.address=:80"
-      - "--entrypoints.websecure.address=:443"
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.dockroute.rule=Host(\`dockroute.localhost\`)"
-      - "traefik.http.services.dockroute.loadbalancer.server.port=8080"
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - dockroute
-
-networks:
-  dockroute:
-    external: true
 EOF
 	fi
+
+	cat >>"$GENERATED_COMPOSE" <<EOF
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dockroute.rule=Host(\`dockroute.localhost\`)"
+      - "traefik.http.services.dockroute.loadbalancer.server.port=8080"
+    ports:
+      - "80:80"
+      - "443:443"
+EOF
+
+	if tls_active; then
+		cat >>"$GENERATED_COMPOSE" <<EOF
+      - "5432:5432"
+EOF
+	fi
+
+	cat >>"$GENERATED_COMPOSE" <<EOF
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${DYNAMIC_DIR}:/etc/traefik/dynamic:ro
+EOF
+
+	if tls_active; then
+		cat >>"$GENERATED_COMPOSE" <<EOF
+      - ${CERTS_DIR}:/etc/traefik/certs:ro
+EOF
+	fi
+
+	cat >>"$GENERATED_COMPOSE" <<EOF
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - dockroute
+
+networks:
+  dockroute:
+    external: true
+EOF
 }
 
 active_compose() {
@@ -155,8 +231,10 @@ cmd_tls_setup() {
 	mkcert -cert-file "${CERTS_DIR}/cert.pem" -key-file "${CERTS_DIR}/key.pem" \
 		"*.localhost" "localhost" 2>&1
 
-	# Write Traefik dynamic config
-	cat >"$DYNAMIC_CONFIG" <<'EOF'
+	# Write Traefik dynamic config (atomic write)
+	mkdir -p "$DYNAMIC_DIR"
+	local tmp="${TLS_DYNAMIC}.tmp"
+	cat >"$tmp" <<'EOF'
 tls:
   certificates:
     - certFile: /etc/traefik/certs/cert.pem
@@ -172,11 +250,18 @@ http:
       redirectScheme:
         scheme: https
 EOF
+	mv "$tmp" "$TLS_DYNAMIC"
+
+	# Remove legacy config if it still exists
+	rm -f "$DYNAMIC_CONFIG"
+
+	# Regenerate routes config to add secure routers for https-flagged routes
+	generate_routes_config
 
 	echo ""
 	echo -e "${GREEN}✓ TLS configured${NC}"
 	echo "  Certs:  ${CERTS_DIR}/"
-	echo "  Config: ${DYNAMIC_CONFIG}"
+	echo "  Config: ${TLS_DYNAMIC}"
 	echo ""
 	echo "Restart the proxy to activate HTTPS and PostgreSQL routing:"
 	echo "  dockroute stop && dockroute start"
@@ -227,9 +312,15 @@ cmd_tls_remove() {
 		removed=true
 	fi
 
+	if [[ -f "$TLS_DYNAMIC" ]]; then
+		rm -f "$TLS_DYNAMIC"
+		echo -e "${GREEN}✓ Removed dynamic config${NC}"
+		removed=true
+	fi
+
+	# Clean up legacy config location
 	if [[ -f "$DYNAMIC_CONFIG" ]]; then
 		rm -f "$DYNAMIC_CONFIG"
-		echo -e "${GREEN}✓ Removed dynamic config${NC}"
 		removed=true
 	fi
 
@@ -240,12 +331,193 @@ cmd_tls_remove() {
 	fi
 
 	if [[ "$removed" == true ]]; then
+		# Regenerate routes config to strip secure routers
+		generate_routes_config
 		echo ""
 		echo "Restart the proxy to deactivate PostgreSQL routing:"
 		echo "  dockroute stop && dockroute start"
 	else
 		echo "Nothing to remove — TLS is not configured"
 	fi
+}
+
+cmd_route() {
+	local subcmd="${1:-list}"
+	shift 2>/dev/null || true
+	case "$subcmd" in
+	add) cmd_route_add "$@" ;;
+	list) cmd_route_list ;;
+	remove) cmd_route_remove "$@" ;;
+	*)
+		echo "Usage: dockroute route <add|list|remove>"
+		echo ""
+		echo "  add <hostname> <port> [--https]   Route hostname to a local port"
+		echo "  list                               List host routes"
+		echo "  remove <hostname>                  Remove a host route"
+		;;
+	esac
+}
+
+cmd_route_add() {
+	local hostname=""
+	local port=""
+	local https_flag=""
+
+	# Parse arguments
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--https)
+			https_flag="https"
+			shift
+			;;
+		*)
+			if [[ -z "$hostname" ]]; then
+				hostname="$1"
+			elif [[ -z "$port" ]]; then
+				port="$1"
+			else
+				echo -e "${RED}Error: Unexpected argument: $1${NC}"
+				echo "Usage: dockroute route add <hostname> <port> [--https]"
+				exit 1
+			fi
+			shift
+			;;
+		esac
+	done
+
+	# Validate hostname
+	if [[ -z "$hostname" || -z "$port" ]]; then
+		echo "Usage: dockroute route add <hostname> <port> [--https]"
+		echo ""
+		echo "Example: dockroute route add myapp.localhost 3000"
+		exit 1
+	fi
+
+	local hostname_re='^[a-z0-9]([a-z0-9-]*[a-z0-9])?\.localhost$'
+	if ! [[ "$hostname" =~ $hostname_re ]]; then
+		echo -e "${RED}Error: Invalid hostname '${hostname}'${NC}"
+		echo "  Must be <name>.localhost (e.g., myapp.localhost)"
+		echo "  Nested subdomains are not supported (e.g., mail.myapp.localhost)"
+		exit 1
+	fi
+
+	if [[ "$hostname" == "dockroute.localhost" ]]; then
+		echo -e "${RED}Error: 'dockroute.localhost' is reserved for the dashboard${NC}"
+		exit 1
+	fi
+
+	# Validate port
+	if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then
+		echo -e "${RED}Error: Port must be between 1 and 65535${NC}"
+		exit 1
+	fi
+
+	# Validate --https requires TLS
+	if [[ -n "$https_flag" ]] && ! tls_active; then
+		echo -e "${RED}Error: --https requires TLS to be set up${NC}"
+		echo "  Run: dockroute tls setup"
+		exit 1
+	fi
+
+	# Collision detection: check Traefik API for Docker-provided routes
+	if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${PROXY_NAME}$"; then
+		local routers
+		routers=$(curl -s http://dockroute.localhost/api/http/routers 2>/dev/null || echo "")
+		# shellcheck disable=SC2016
+		local host_re='Host\(`'"${hostname}"'`\)'
+		if echo "$routers" | grep -q "@docker" && echo "$routers" | grep -q "$host_re"; then
+			echo -e "${RED}Error: '${hostname}' is already routed by a Docker container${NC}"
+			echo "  Remove the Traefik labels from the container or use a different hostname"
+			exit 1
+		fi
+	fi
+
+	# Check for no-op (same hostname + port + https state)
+	if [[ -f "$ROUTES_FILE" ]]; then
+		local existing
+		existing=$(grep "^${hostname} " "$ROUTES_FILE" 2>/dev/null || echo "")
+		if [[ "$existing" == "${hostname} ${port}${https_flag:+ ${https_flag}}" ]]; then
+			echo -e "${GREEN}✓ Route already exists: ${hostname} → localhost:${port}${NC}"
+			return
+		fi
+	fi
+
+	# Write route (replace existing entry for this hostname)
+	mkdir -p "$DOCKROUTE_DIR"
+	if [[ -f "$ROUTES_FILE" ]]; then
+		grep -v "^${hostname} " "$ROUTES_FILE" >"${ROUTES_FILE}.tmp" || true
+		mv "${ROUTES_FILE}.tmp" "$ROUTES_FILE"
+	fi
+	echo "${hostname} ${port}${https_flag:+ ${https_flag}}" >>"$ROUTES_FILE"
+
+	# Generate Traefik config
+	generate_routes_config
+
+	echo -e "${GREEN}✓ Route added: ${hostname} → localhost:${port}${NC}"
+	if [[ -n "$https_flag" ]]; then
+		echo "  http://${hostname}"
+		echo "  https://${hostname}"
+	else
+		echo "  http://${hostname}"
+	fi
+
+	# Reconcile proxy state
+	reconcile_proxy
+}
+
+cmd_route_list() {
+	if ! routes_active; then
+		echo "No host routes configured"
+		echo ""
+		echo "Add one with: dockroute route add myapp.localhost 3000"
+		return
+	fi
+
+	echo "Host routes:"
+	while IFS=' ' read -r hostname port flags; do
+		[[ -z "$hostname" || "$hostname" == \#* ]] && continue
+		echo "  http://${hostname} → localhost:${port}"
+		if [[ "$flags" == "https" ]]; then
+			if tls_active; then
+				echo "  https://${hostname} → localhost:${port}"
+			else
+				echo "  (https pending tls setup)"
+			fi
+		fi
+	done <"$ROUTES_FILE"
+}
+
+cmd_route_remove() {
+	local hostname="${1:-}"
+
+	if [[ -z "$hostname" ]]; then
+		echo "Usage: dockroute route remove <hostname>"
+		echo ""
+		echo "Example: dockroute route remove myapp.localhost"
+		exit 1
+	fi
+
+	if ! [[ -f "$ROUTES_FILE" ]] || ! grep -q "^${hostname} " "$ROUTES_FILE"; then
+		echo -e "${RED}Error: No route found for '${hostname}'${NC}"
+		exit 1
+	fi
+
+	# Remove route
+	grep -v "^${hostname} " "$ROUTES_FILE" >"${ROUTES_FILE}.tmp" || true
+	mv "${ROUTES_FILE}.tmp" "$ROUTES_FILE"
+
+	# Clean up empty file
+	if ! [[ -s "$ROUTES_FILE" ]]; then
+		rm -f "$ROUTES_FILE"
+	fi
+
+	# Regenerate Traefik config
+	generate_routes_config
+
+	echo -e "${GREEN}✓ Route removed: ${hostname}${NC}"
+
+	# Reconcile proxy state
+	reconcile_proxy
 }
 
 migrate_network() {
@@ -289,36 +561,50 @@ cmd_start() {
 		docker network create "$NETWORK_NAME"
 	fi
 
-	# Generate compose file with current TLS state
+	# Migrate and generate configs
+	migrate_dynamic_config
+	generate_routes_config
 	generate_compose
 	local compose
 	compose=$(active_compose)
 
-	# Start Traefik if not running
-	if ! docker ps --format '{{.Names}}' | grep -q "^${PROXY_NAME}$"; then
-		# Check for port 5432 conflict when TLS is active
-		if tls_active; then
-			if lsof -i :5432 -sTCP:LISTEN >/dev/null 2>&1; then
-				echo -e "${YELLOW}Warning: Port 5432 is already in use — PostgreSQL routing will not work${NC}"
-				echo "  Stop the local PostgreSQL server and restart dockroute"
-				echo ""
-			fi
-		fi
+	local was_running=false
+	if docker ps --format '{{.Names}}' | grep -q "^${PROXY_NAME}$"; then
+		was_running=true
+	fi
 
-		echo -e "${GREEN}Starting dockroute...${NC}"
-		docker compose -f "$compose" -p dockroute up -d
-		echo ""
-		echo -e "${GREEN}✓ Proxy running${NC}"
-		echo "  Dashboard: http://dockroute.localhost"
-		echo "  Projects:  http://<project>.localhost"
-		if tls_active; then
-			echo "  PostgreSQL: <project>-db.localhost:5432 (sslmode=require)"
-		else
+	# Check for port 5432 conflict when TLS is active
+	if tls_active; then
+		if lsof -i :5432 -sTCP:LISTEN >/dev/null 2>&1; then
+			echo -e "${YELLOW}Warning: Port 5432 is already in use — PostgreSQL routing will not work${NC}"
+			echo "  Stop the local PostgreSQL server and restart dockroute"
 			echo ""
-			echo -e "  Tip: Run ${GREEN}dockroute tls setup${NC} to enable PostgreSQL hostname routing"
 		fi
+	fi
+
+	# Always run up -d to reconcile config drift
+	if [[ "$was_running" == false ]]; then
+		echo -e "${GREEN}Starting dockroute...${NC}"
+	fi
+	docker compose -f "$compose" -p dockroute up -d
+
+	echo ""
+	if [[ "$was_running" == false ]]; then
+		echo -e "${GREEN}✓ Proxy running${NC}"
 	else
-		echo -e "${GREEN}✓ Proxy already running${NC}"
+		echo -e "${GREEN}✓ Proxy running (config reconciled)${NC}"
+	fi
+	echo "  Dashboard: http://dockroute.localhost"
+	echo "  Projects:  http://<project>.localhost"
+	if tls_active; then
+		echo "  PostgreSQL: <project>-db.localhost:5432 (sslmode=require)"
+	fi
+	if routes_active; then
+		echo "  Host routes: $(wc -l <"$ROUTES_FILE" | tr -d ' ') configured (dockroute route list)"
+	fi
+	if ! tls_active; then
+		echo ""
+		echo -e "  Tip: Run ${GREEN}dockroute tls setup${NC} to enable PostgreSQL hostname routing"
 	fi
 }
 
@@ -442,6 +728,8 @@ cmd_ensure() {
 		docker network create "$NETWORK_NAME" >/dev/null
 	fi
 
+	migrate_dynamic_config
+	generate_routes_config
 	generate_compose
 	local compose
 	compose=$(active_compose)
@@ -1106,19 +1394,30 @@ cmd_help() {
 	echo "Usage: dockroute <command>"
 	echo ""
 	echo "Commands:"
-	echo "  start       Start the proxy"
-	echo "  stop        Stop the proxy"
-	echo "  status      Show proxy status and routed services"
-	echo "  check       Check a compose file for dockroute issues"
-	echo "  logs        Follow proxy logs"
-	echo "  ensure      Start proxy if not running (for scripts)"
-	echo "  tls setup   Generate TLS certs for HTTPS and PostgreSQL routing"
-	echo "  tls status  Show TLS certificate status"
-	echo "  tls remove  Remove TLS certs and config"
-	echo "  version     Show version"
-	echo "  help        Show this help"
+	echo "  start            Start the proxy"
+	echo "  stop             Stop the proxy"
+	echo "  status           Show proxy status and routed services"
+	echo "  check            Check a compose file for dockroute issues"
+	echo "  logs             Follow proxy logs"
+	echo "  ensure           Start proxy if not running (for scripts)"
+	echo "  route add        Route a hostname to a local port"
+	echo "  route list       List host routes"
+	echo "  route remove     Remove a host route"
+	echo "  tls setup        Generate TLS certs for HTTPS and PostgreSQL routing"
+	echo "  tls status       Show TLS certificate status"
+	echo "  tls remove       Remove TLS certs and config"
+	echo "  version          Show version"
+	echo "  help             Show this help"
 	echo ""
-	echo "Project Setup (HTTP):"
+	echo "Host Routing (native apps):"
+	echo "  Route a hostname to a local port — no Docker container needed:"
+	echo ""
+	echo "    dockroute route add myapp.localhost 3000"
+	echo "    dockroute route add myapp.localhost 3000 --https"
+	echo ""
+	echo "  Then access at: http://myapp.localhost"
+	echo ""
+	echo "Project Setup (Docker containers):"
 	echo "  Add to your docker-compose.yml:"
 	echo ""
 	echo "    services:"
@@ -1177,6 +1476,10 @@ status) cmd_status ;;
 check) cmd_check "$@" ;;
 logs) cmd_logs ;;
 ensure) cmd_ensure ;;
+route)
+	shift
+	cmd_route "$@"
+	;;
 tls) cmd_tls "$@" ;;
 version) cmd_version ;;
 -v) cmd_version ;;

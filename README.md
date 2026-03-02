@@ -237,6 +237,40 @@ REDIS_PORT=6380
 
 The dashboard is available at `dockroute.localhost`.
 
+## Host Routing
+
+Developers often run infrastructure (Postgres, Redis) in Docker but run application code natively for faster iteration. dockroute can route hostnames to native processes running on your machine — no Docker container needed:
+
+```bash
+# Route myapp.localhost to your local dev server on port 3000
+dockroute route add myapp.localhost 3000
+
+# Start your native app
+cd ~/projects/myapp && npm run dev  # listens on port 3000
+
+# Access at http://myapp.localhost
+curl http://myapp.localhost
+```
+
+This creates a Traefik file-provider route pointing at `host.docker.internal:<port>`, so it works alongside Docker-routed services. Use `dockroute route` for native apps and Docker labels for containerized apps.
+
+### Commands
+
+```bash
+dockroute route add myapp.localhost 3000          # Add a route
+dockroute route add myapp.localhost 3000 --https  # Add with HTTPS (requires tls setup)
+dockroute route list                              # List all host routes
+dockroute route remove myapp.localhost            # Remove a route
+```
+
+### Rules
+
+- Hostnames must be flat `<name>.localhost` — nested subdomains (e.g., `mail.myapp.localhost`) are not supported
+- `dockroute.localhost` is reserved for the dashboard
+- `--https` requires `dockroute tls setup` and creates dual-stack routing (HTTP + HTTPS)
+- If a Docker container already claims the same hostname, `route add` will fail — remove the container's labels or choose a different hostname
+- Running `dockroute route add` with the same hostname replaces the existing entry (port, https state)
+
 ## HTTPS Routing
 
 After running `dockroute tls setup`, web services can use HTTPS via the `websecure` entrypoint. This is opt-in — HTTP-only services continue to work as before.
@@ -405,6 +439,7 @@ export const instance = new Proxy({} as MyType, {
 3. **Label-based routing**: Traefik reads container labels to configure routes
 4. **Hostname resolution**: `.localhost` domains resolve to 127.0.0.1 automatically
 5. **Project isolation**: Each project's `default` network keeps internal services separated; only Traefik-labeled services share the `dockroute` network
+6. **File provider**: Host routes (from `dockroute route`) are written as Traefik file-provider configs, hot-reloaded without proxy restart
 
 ## Commands
 
@@ -416,6 +451,9 @@ export const instance = new Proxy({} as MyType, {
 | `dockroute check [path]` | Check a compose file for dockroute issues |
 | `dockroute logs` | Follow proxy logs |
 | `dockroute ensure` | Start if not running (for scripts) |
+| `dockroute route add <host> <port>` | Route hostname to a local port |
+| `dockroute route list` | List host routes |
+| `dockroute route remove <host>` | Remove a host route |
 | `dockroute tls setup` | Generate TLS certs for HTTPS and PostgreSQL routing |
 | `dockroute tls status` | Show TLS certificate status |
 | `dockroute tls remove` | Remove TLS certs and config |
