@@ -257,12 +257,28 @@ This creates a Traefik file-provider route pointing at `host.docker.internal:<po
 ### Commands
 
 ```bash
-dockroute route add myapp.localhost 3000          # Add a route
-dockroute route add myapp.localhost 3000 --https  # Add with HTTPS (requires tls setup)
-dockroute route add myapp-db.localhost 5432 --tcp # Add TCP route (requires tls setup)
-dockroute route list                              # List all host routes
-dockroute route remove myapp.localhost            # Remove a route
+dockroute route add myapp.localhost 3000               # Add a route
+dockroute route add myapp.localhost 3000 --https       # Add with HTTPS (requires tls setup)
+dockroute route add myapp-db.localhost 5432 --tcp      # Add TCP route (requires tls setup)
+dockroute route add myapp.localhost 3000 --find-port   # Auto-pick a free port (see below)
+dockroute route list                                   # List all host routes
+dockroute route remove myapp.localhost                 # Remove a route
 ```
+
+### Auto Port Selection
+
+When your dev server's preferred port might be busy (another project, SSH tunnel, etc.), use `--find-port` to let dockroute pick the next available port automatically. The chosen port is printed to stdout so scripts can capture it:
+
+```bash
+# Auto-pick a free port starting from 3000
+port=$(dockroute route add myapp.localhost 3000 --find-port)
+npm run dev -- --port "$port"
+
+# You only ever use the hostname — the port is invisible
+curl http://myapp.localhost
+```
+
+Status output goes to stderr, so `$()` captures only the port number. If port 3000 is free, it uses 3000. If busy, it tries 3001, 3002, etc.
 
 ### TCP Host Routes
 

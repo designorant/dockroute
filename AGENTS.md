@@ -142,13 +142,15 @@ networks:
 For apps running natively on the host (not in Docker), use `dockroute route` instead of Docker labels:
 
 ```bash
-dockroute route add myapp.localhost 3000          # HTTP only
-dockroute route add myapp.localhost 3000 --https  # HTTP + HTTPS (requires tls setup)
-dockroute route add myapp-db.localhost 5432 --tcp # TCP/PostgreSQL (requires tls setup)
+dockroute route add myapp.localhost 3000               # HTTP only
+dockroute route add myapp.localhost 3000 --https       # HTTP + HTTPS (requires tls setup)
+dockroute route add myapp-db.localhost 5432 --tcp      # TCP/PostgreSQL (requires tls setup)
+dockroute route add myapp.localhost 3000 --find-port   # Auto-pick free port (for scripts)
 ```
 
 - Use `dockroute route` when: the app runs natively (e.g., `npm run dev` on the host)
 - Use Docker labels when: the app runs in a Docker container
+- `--find-port`: auto-picks the next free port starting from the given one, prints the chosen port to stdout. Use in scripts: `port=$(dockroute route add myapp.localhost 3000 --find-port)`
 - `--tcp` routes use `HostSNI()` on the `postgres` entrypoint (port 5432) — connect with `sslmode=require`
 - `--https` and `--tcp` are mutually exclusive
 - Hostnames must be flat `<name>.localhost` — no nested subdomains

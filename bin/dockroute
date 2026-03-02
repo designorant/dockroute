@@ -4,7 +4,7 @@ set -e
 # dockroute - Local development proxy for Docker
 # Eliminates port conflicts by routing via hostnames
 
-VERSION="2.5.0"
+VERSION="2.6.0"
 PROXY_NAME="dockroute-traefik"
 NETWORK_NAME="dockroute"
 
@@ -425,6 +425,7 @@ cmd_route_add() {
 	local port=""
 	local https_flag=""
 	local tcp_flag=""
+	local find_port=""
 
 	# Parse arguments
 	while [[ $# -gt 0 ]]; do
@@ -437,14 +438,18 @@ cmd_route_add() {
 			tcp_flag="tcp"
 			shift
 			;;
+		--find-port)
+			find_port="1"
+			shift
+			;;
 		*)
 			if [[ -z "$hostname" ]]; then
 				hostname="$1"
 			elif [[ -z "$port" ]]; then
 				port="$1"
 			else
-				echo -e "${RED}Error: Unexpected argument: $1${NC}"
-				echo "Usage: dockroute route add <hostname> <port> [--https|--tcp]"
+				echo -e "${RED}Error: Unexpected argument: $1${NC}" >&2
+				echo "Usage: dockroute route add <hostname> <port> [--https|--tcp|--find-port]" >&2
 				exit 1
 			fi
 			shift
@@ -454,15 +459,15 @@ cmd_route_add() {
 
 	# Validate mutually exclusive flags
 	if [[ -n "$https_flag" && -n "$tcp_flag" ]]; then
-		echo -e "${RED}Error: --https and --tcp are mutually exclusive${NC}"
+		echo -e "${RED}Error: --https and --tcp are mutually exclusive${NC}" >&2
 		exit 1
 	fi
 
 	# Validate hostname
 	if [[ -z "$hostname" || -z "$port" ]]; then
-		echo "Usage: dockroute route add <hostname> <port> [--https|--tcp]"
-		echo ""
-		echo "Example: dockroute route add myapp.localhost 3000"
+		echo "Usage: dockroute route add <hostname> <port> [--https|--tcp|--find-port]" >&2
+		echo "" >&2
+		echo "Example: dockroute route add myapp.localhost 3000" >&2
 		exit 1
 	fi
 
@@ -481,8 +486,20 @@ cmd_route_add() {
 
 	# Validate port
 	if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then
-		echo -e "${RED}Error: Port must be between 1 and 65535${NC}"
+		echo -e "${RED}Error: Port must be between 1 and 65535${NC}" >&2
 		exit 1
+	fi
+
+	# --find-port: scan from the given port until a free one is found
+	if [[ -n "$find_port" ]]; then
+		local original_port="$port"
+		while lsof -i :"$port" -sTCP:LISTEN >/dev/null 2>&1; do
+			port=$((port + 1))
+			if [[ "$port" -gt 65535 ]]; then
+				echo -e "${RED}Error: No free port found starting from ${original_port}${NC}" >&2
+				exit 1
+			fi
+		done
 	fi
 
 	# Validate --https/--tcp requires TLS
@@ -510,8 +527,8 @@ cmd_route_add() {
 		local routers
 		routers=$(curl -s http://dockroute.localhost/api/http/routers 2>/dev/null || echo "")
 		if echo "$routers" | sed 's/},/}\n/g' | grep "@docker" | grep -q "$host_re"; then
-			echo -e "${RED}Error: '${hostname}' is already routed by a Docker container${NC}"
-			echo "  Remove the Traefik labels from the container or use a different hostname"
+			echo -e "${RED}Error: '${hostname}' is already routed by a Docker container${NC}" >&2
+			echo "  Remove the Traefik labels from the container or use a different hostname" >&2
 			exit 1
 		fi
 
@@ -520,8 +537,8 @@ cmd_route_add() {
 			local tcp_routers
 			tcp_routers=$(curl -s http://dockroute.localhost/api/tcp/routers 2>/dev/null || echo "")
 			if echo "$tcp_routers" | sed 's/},/}\n/g' | grep "@docker" | grep -q "$sni_re"; then
-				echo -e "${RED}Error: '${hostname}' is already routed by a Docker container (TCP)${NC}"
-				echo "  Remove the TCP labels from the container or use a different hostname"
+				echo -e "${RED}Error: '${hostname}' is already routed by a Docker container (TCP)${NC}" >&2
+				echo "  Remove the TCP labels from the container or use a different hostname" >&2
 				exit 1
 			fi
 		fi
@@ -532,34 +549,47 @@ cmd_route_add() {
 		local existing
 		existing=$(grep "^${hostname} " "$ROUTES_FILE" 2>/dev/null || echo "")
 		if [[ "$existing" == "${hostname} ${port}${route_flags:+ ${route_flags}}" ]]; then
-			echo -e "${GREEN}✓ Route already exists: ${hostname} → localhost:${port}${NC}"
+			echo -e "${GREEN}✓ Route already exists: ${hostname} → localhost:${port}${NC}" >&2
+			if [[ -n "$find_port" ]]; then
+				echo "$port"
+			fi
 			return
 		fi
 	fi
 
+	# Save before generate_routes_config clobbers hostname/port (its
+	# while-read loops run in the current scope and reuse those names)
+	local saved_hostname="$hostname"
+	local saved_port="$port"
+
 	# Write route (replace existing entry for this hostname)
 	mkdir -p "$DOCKROUTE_DIR"
 	if [[ -f "$ROUTES_FILE" ]]; then
-		grep -v "^${hostname} " "$ROUTES_FILE" >"${ROUTES_FILE}.tmp" || true
+		grep -v "^${saved_hostname} " "$ROUTES_FILE" >"${ROUTES_FILE}.tmp" || true
 		mv "${ROUTES_FILE}.tmp" "$ROUTES_FILE"
 	fi
-	echo "${hostname} ${port}${route_flags:+ ${route_flags}}" >>"$ROUTES_FILE"
+	echo "${saved_hostname} ${saved_port}${route_flags:+ ${route_flags}}" >>"$ROUTES_FILE"
 
 	# Generate Traefik config
 	generate_routes_config
 
-	echo -e "${GREEN}✓ Route added: ${hostname} → localhost:${port}${NC}"
+	echo -e "${GREEN}✓ Route added: ${saved_hostname} → localhost:${saved_port}${NC}" >&2
 	if [[ -n "$tcp_flag" ]]; then
-		echo "  ${hostname}:5432 → localhost:${port} (tcp, sslmode=require)"
+		echo "  ${saved_hostname}:5432 → localhost:${saved_port} (tcp, sslmode=require)" >&2
 	elif [[ -n "$https_flag" ]]; then
-		echo "  http://${hostname}"
-		echo "  https://${hostname}"
+		echo "  http://${saved_hostname}" >&2
+		echo "  https://${saved_hostname}" >&2
 	else
-		echo "  http://${hostname}"
+		echo "  http://${saved_hostname}" >&2
 	fi
 
 	# Reconcile proxy state
-	reconcile_proxy
+	if [[ -n "$find_port" ]]; then
+		reconcile_proxy >&2
+		echo "$saved_port"
+	else
+		reconcile_proxy
+	fi
 }
 
 cmd_route_list() {
@@ -1699,9 +1729,12 @@ cmd_help() {
 	echo "    dockroute route add myapp.localhost 3000"
 	echo "    dockroute route add myapp.localhost 3000 --https"
 	echo "    dockroute route add myapp-db.localhost 5432 --tcp"
+	echo "    dockroute route add myapp.localhost 3000 --find-port"
 	echo ""
 	echo "  HTTP/HTTPS: access at http://myapp.localhost"
 	echo "  TCP: connect with psql \"host=myapp-db.localhost sslmode=require\""
+	echo "  --find-port: auto-pick a free port, print it to stdout for scripts:"
+	echo "    port=\$(dockroute route add myapp.localhost 3000 --find-port)"
 	echo ""
 	echo "Project Setup (Docker containers):"
 	echo "  Add to your docker-compose.yml:"
